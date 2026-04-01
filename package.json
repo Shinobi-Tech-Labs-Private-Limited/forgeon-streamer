@@ -1,0 +1,22 @@
+{
+  "name": "forgeon-streamer",
+  "version": "1.0.0",
+  "description": "Tray-only Electron app that manages the ForgeOn camera streaming server",
+  "main": "dist/main.js",
+  "scripts": {
+    "dev": "tsc && electron dist/main.js",
+    "build": "tsc",
+    "package": "tsc && electron-builder --publish never"
+  },
+  "author": "Forge Labs",
+  "license": "MIT",
+  "dependencies": {
+    "electron-store": "^8.2.0"
+  },
+  "devDependencies": {
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8",
+    "typescript": "^5.7.2",
+    "@types/node": "^22.10.2"
+  }
+}

@@ -1,0 +1,31 @@
+# Node
+node_modules/
+npm-debug.log*
+
+# TypeScript build output
+dist/
+
+# Electron Builder output
+release/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+python/site-packages/
+python/app35_cam_sole.py
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Env
+.env
+.env.local
