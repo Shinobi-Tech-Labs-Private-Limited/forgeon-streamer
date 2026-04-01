@@ -13,7 +13,6 @@ __pycache__/
 *.pyc
 *.pyo
 python/site-packages/
-python/app35_cam_sole.py
 *.egg-info/
 
 # OS
