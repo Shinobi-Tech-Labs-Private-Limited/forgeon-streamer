@@ -1,0 +1,70 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            platform: mac
+          - os: windows-latest
+            platform: win
+          - os: ubuntu-latest
+            platform: linux
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Install Python dependencies into bundle
+        run: pip install --target=python/site-packages -r python/requirements.txt
+
+      - name: Build TypeScript
+        run: npm run build
+
+      - name: Build Electron app (macOS)
+        if: matrix.platform == 'mac'
+        run: npx electron-builder --mac --publish never
+
+      - name: Build Electron app (Windows)
+        if: matrix.platform == 'win'
+        run: npx electron-builder --win --publish never
+
+      - name: Build Electron app (Linux)
+        if: matrix.platform == 'linux'
+        run: npx electron-builder --linux --publish never
+
+      - name: Upload release artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.dmg
+            release/*.exe
+            release/*.AppImage
+            release/*.yml
+          draft: false
+          prerelease: false
