@@ -177,18 +177,37 @@ export class PythonManager extends EventEmitter {
   }
 
   findPython(): string | null {
-    // 1. Check bundled Python in resources
-    const bundledPython = path.join(this.getResourcesPath(), 'python', 'bin', 'python3');
-    if (fs.existsSync(bundledPython)) {
-      return bundledPython;
+    const resourcesPath = this.getResourcesPath();
+
+    // 1. Check bundled Python in resources (platform-specific paths)
+    const bundledCandidates = process.platform === 'win32'
+      ? [
+          path.join(resourcesPath, 'python', 'runtime', 'python.exe'),
+          path.join(resourcesPath, 'python', 'python.exe'),
+        ]
+      : [
+          path.join(resourcesPath, 'python', 'runtime', 'bin', 'python3'),
+          path.join(resourcesPath, 'python', 'bin', 'python3'),
+        ];
+
+    for (const candidate of bundledCandidates) {
+      if (fs.existsSync(candidate)) {
+        this.emit('log', `Using bundled Python: ${candidate}`);
+        return candidate;
+      }
     }
 
-    // 2. Check system python3 then python
-    const candidates = ['python3', 'python'];
-    for (const cmd of candidates) {
+    // 2. Fall back to system python3 then python
+    const systemCandidates = process.platform === 'win32'
+      ? ['python', 'python3']
+      : ['python3', 'python'];
+
+    for (const cmd of systemCandidates) {
       try {
         const { execSync } = require('child_process');
-        execSync(`which ${cmd}`, { stdio: 'ignore' });
+        const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+        execSync(`${whichCmd} ${cmd}`, { stdio: 'ignore' });
+        this.emit('log', `Using system Python: ${cmd}`);
         return cmd;
       } catch {
         // not found, try next

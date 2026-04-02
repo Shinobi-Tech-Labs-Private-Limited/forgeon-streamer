@@ -16,10 +16,13 @@ extraResources:
       - "**/*"
       - "!__pycache__/**"
       - "!*.pyc"
+      - "!*.pyo"
   - from: assets/
     to: assets/
     filter:
       - "**/*"
+
+asar: true
 
 mac:
   target: dmg
