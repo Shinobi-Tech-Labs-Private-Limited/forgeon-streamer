@@ -83,7 +83,7 @@ app.on('before-quit', async () => {
   }
 });
 
-// Prevent default window-all-closed behavior (keep app running as tray)
-app.on('window-all-closed', (e: Event) => {
-  e.preventDefault();
+// Prevent app from quitting when no windows are open (tray-only app)
+app.on('window-all-closed', () => {
+  // Do nothing — keep running as tray app
 });
