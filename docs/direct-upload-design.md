@@ -79,6 +79,23 @@ In `app35_cam_sole.py`:
   failures stay visible in the queue, never silently dropped. `.uploaded` marker per recording
   dir once complete — the retention job (V14) may only delete recordings that carry it.
 
+## 3b. Recovery & resume (stuck balls are waiting, never lost)
+
+- The queue file + the recording folders on disk are the source of truth. A "stuck" ball is a
+  queue entry in `failed`/`queued` — its files and its assessment/instance linkage are on disk,
+  so it can be uploaded hours or days later without the original browser session.
+- **Auto-resume is the default**: the worker reloads the queue at app start and drains it on a
+  bounded backoff loop. Internet restored / laptop rebooted → uploads continue with no operator
+  action.
+- **Manual doors** when needed:
+  - the rig's own page (`localhost:5000`) gets an upload-queue panel — per-ball state, attempts,
+    last error, Retry / Retry-all-failed (works standing at the machine, no cloud needed);
+  - the record page shows the same via `GET /api/upload_queue` polling.
+- Init-at-upload means a late retry simply re-inits for fresh signed URLs; within one attempt,
+  GCS resumable sessions continue a partially-transferred file.
+- Safety rule: retention/cleanup may only ever delete a recording dir bearing the `.uploaded`
+  marker — un-uploaded balls are immune to cleanup regardless of age.
+
 ## 4. Identity handshake (closes R20)
 
 The record page passes `assessment_id`, `athlete_id`, `instance_no` to the rig at
