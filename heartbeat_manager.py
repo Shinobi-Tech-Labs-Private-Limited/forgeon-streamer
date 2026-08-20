@@ -1,13 +1,21 @@
 import json
+import logging
 import os
 import subprocess
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any
+
+
+log = logging.getLogger("rig.heartbeat")
+
+# Files whose mtime predates a slice start by more than this cannot contain
+# events inside the slice window; they are skipped unopened.
+MTIME_SKEW_GRACE_SECONDS = 60.0
 
 
 class HeartbeatServiceError(RuntimeError):
@@ -46,6 +54,10 @@ class HeartbeatManager:
         default_source = base_dir / "heartbeat_sessions"
         self.source_dir = Path(os.environ.get("HEARTBEAT_SESSIONS_DIR", str(default_source))).expanduser()
         self.timeout_seconds = float(os.environ.get("HEARTBEAT_TIMEOUT_SECONDS", "0.8"))
+        # Slice windows are extended by this much past the requested stop and
+        # trimmed downstream (_sync_heartbeat_file cuts to the video window),
+        # so the last in-flight notification is not lost at the boundary.
+        self.tail_grace_seconds = float(os.environ.get("HEARTBEAT_TAIL_GRACE_SECONDS", "1.5"))
         self.autostart_enabled = os.environ.get("HEARTBEAT_AUTOSTART", "1").strip().lower() not in (
             "0",
             "false",
@@ -177,10 +189,10 @@ class HeartbeatManager:
             "log_path": str(self.sidecar_log_path.relative_to(self.base_dir)),
         }
 
-    def _request(self, path: str) -> dict[str, Any]:
+    def _request(self, path: str, timeout: float | None = None) -> dict[str, Any]:
         url = f"{self.service_url}{path}"
         try:
-            with urllib.request.urlopen(url, timeout=self.timeout_seconds) as response:
+            with urllib.request.urlopen(url, timeout=timeout or self.timeout_seconds) as response:
                 return json.loads(response.read().decode("utf-8") or "{}")
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
             raise HeartbeatServiceError(str(exc)) from exc
@@ -210,12 +222,10 @@ class HeartbeatManager:
         return self._request("/recording")
 
     def devices(self) -> dict[str, Any]:
-        previous_timeout = self.timeout_seconds
-        try:
-            self.timeout_seconds = max(previous_timeout, 8.0)
-            return self._request("/devices")
-        finally:
-            self.timeout_seconds = previous_timeout
+        # Per-request timeout: the old try/finally mutated the instance-wide
+        # timeout_seconds, and two overlapping calls could leave it stuck at
+        # 8.0 for every 1 Hz status poll until restart.
+        return self._request("/devices", timeout=max(self.timeout_seconds, 8.0))
 
     def connect_device(self, device: str | None) -> dict[str, Any]:
         device_filter = (device or "").strip() or None
@@ -234,8 +244,17 @@ class HeartbeatManager:
             key=lambda p: p.stat().st_mtime,
         )
 
-    def _iter_events(self, start: datetime, stop: datetime):
+    def _iter_events(self, start: datetime, stop: datetime, stats: dict[str, int] | None = None):
         for path in self._source_logs():
+            try:
+                if path.stat().st_mtime < start.timestamp() - MTIME_SKEW_GRACE_SECONDS:
+                    if stats is not None:
+                        stats["files_skipped_mtime"] = stats.get("files_skipped_mtime", 0) + 1
+                    continue
+            except OSError:
+                pass
+            if stats is not None:
+                stats["files_scanned"] = stats.get("files_scanned", 0) + 1
             try:
                 with path.open("r", encoding="utf-8", errors="ignore") as handle:
                     for line in handle:
@@ -245,6 +264,8 @@ class HeartbeatManager:
                         try:
                             payload = json.loads(line)
                         except json.JSONDecodeError:
+                            if stats is not None:
+                                stats["parse_errors"] = stats.get("parse_errors", 0) + 1
                             continue
                         event_ts = _parse_iso(payload.get("timestamp"))
                         if event_ts is None:
@@ -252,23 +273,48 @@ class HeartbeatManager:
                         if start <= event_ts <= stop:
                             yield payload
             except OSError:
+                if stats is not None:
+                    stats["read_errors"] = stats.get("read_errors", 0) + 1
                 continue
 
     def _write_slice(self, start: datetime, stop: datetime, out_path: Path, meta_path: Path) -> dict[str, Any]:
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        sample_count = 0
+        stats: dict[str, int] = {}
+        total_rows = 0
+        sentinel_rows = 0
         with out_path.open("w", encoding="utf-8") as handle:
-            for payload in self._iter_events(start, stop):
+            for payload in self._iter_events(start, stop, stats=stats):
                 handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
-                sample_count += 1
+                total_rows += 1
+                # connected:false rows are disconnect sentinels, not heart-rate
+                # samples — counting them let a fully-disconnected take report
+                # sample_count 1 and dodge the zero-samples warning.
+                if payload.get("connected") is False:
+                    sentinel_rows += 1
 
+        read_errors = stats.get("read_errors", 0)
+        parse_errors = stats.get("parse_errors", 0)
+        if read_errors or parse_errors:
+            log.warning(
+                "Heartbeat slice %s hit %d unreadable file(s) and %d unparseable line(s) — slice may be partial",
+                out_path.name,
+                read_errors,
+                parse_errors,
+            )
         meta = {
             "ok": True,
             "start": _iso(start),
             "stop": _iso(stop),
             "source_dir": str(self.source_dir),
             "output": str(out_path.relative_to(self.base_dir)),
-            "sample_count": sample_count,
+            "sample_count": total_rows - sentinel_rows,
+            "total_rows": total_rows,
+            "sentinel_rows": sentinel_rows,
+            "read_errors": read_errors,
+            "parse_errors": parse_errors,
+            "files_scanned": stats.get("files_scanned", 0),
+            "files_skipped_mtime": stats.get("files_skipped_mtime", 0),
+            "tail_grace_seconds": self.tail_grace_seconds,
         }
         meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
         return meta
@@ -301,7 +347,7 @@ class HeartbeatManager:
         out_dir = self.session_dir / "heartbeat"
         result = self._write_slice(
             start,
-            stop,
+            stop + timedelta(seconds=self.tail_grace_seconds),
             out_dir / "session_hr.jsonl",
             out_dir / "session_hr_status.json",
         )
@@ -332,7 +378,7 @@ class HeartbeatManager:
         out_dir = rec_dir / "heartbeat"
         result = self._write_slice(
             start,
-            stop,
+            stop + timedelta(seconds=self.tail_grace_seconds),
             out_dir / f"heart_rate_recording_{rec_index}.jsonl",
             out_dir / f"heart_rate_recording_{rec_index}_status.json",
         )
