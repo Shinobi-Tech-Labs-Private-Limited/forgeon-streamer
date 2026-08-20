@@ -1,5 +1,15 @@
 # Changelog
 
+## V14-pre — direct-upload worker (2026-08-20, branch `feat/rig-upload-worker`)
+
+Phase 3 of docs/direct-upload-design.md: `upload_worker.py` (persistent queue at
+`BASE_DIR/upload_queue.json`, background thread, init→PUT→complete against the
+phase-2 API, bounded auto-retry, `.uploaded` marker) + three routes in the app:
+`POST /api/upload_instance` (enqueue, idempotent per assessment+instance),
+`GET /api/upload_queue`, `POST /api/upload_retry`. Configured by
+`FORGEON_API_URL` + `FORGEON_DEVICE_TOKEN`; unset = routes 503, nothing else
+changes. New per-subsystem log: `logs/upload.log`.
+
 ## V14-pre — hardening port (2026-08-20, branch `feat/rig-v13-hardening`)
 
 Re-applied the R1–R24 review hardening (forgeon `fix/rig-v11-hardening` @ 8588a3b1)

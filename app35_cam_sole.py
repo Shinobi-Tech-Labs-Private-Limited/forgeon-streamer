@@ -348,7 +348,7 @@ class SessionLogHandler(logging.Handler):
 RIG_LOG_LEVEL = os.environ.get("RIG_LOG_LEVEL", "INFO").strip().upper()
 RIG_BLE_LOG_LEVEL = os.environ.get("RIG_BLE_LOG_LEVEL", "WARNING").strip().upper()
 _RIG_LOG_FORMAT = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-_RIG_LOG_SUBSYSTEMS = ("app", "sync", "ble", "mic", "heartbeat", "bootstrap")
+_RIG_LOG_SUBSYSTEMS = ("app", "sync", "ble", "mic", "heartbeat", "bootstrap", "upload")
 
 
 def _session_log_path(subsystem):
@@ -3583,6 +3583,23 @@ mic = MicCaptureManager(
     script_path=BASE_DIR / "remote_inmp441_capture.py",
     initial_camera_key=MIC_CAMERA_KEY,
 )
+
+# ---------------------------------------------------------------------------
+# Direct-upload worker (docs/direct-upload-design.md §3). Configured via env:
+#   FORGEON_API_URL      e.g. https://api-dev-new.forgelabs.in/dev
+#   FORGEON_DEVICE_TOKEN the device token minted by POST /rig/devices
+# Unset -> the /api/upload_* routes answer 503 and nothing else changes.
+from upload_worker import UploadWorker
+
+FORGEON_API_URL = os.environ.get("FORGEON_API_URL", "").strip()
+FORGEON_DEVICE_TOKEN = os.environ.get("FORGEON_DEVICE_TOKEN", "").strip()
+upload_worker = None
+if FORGEON_API_URL and FORGEON_DEVICE_TOKEN:
+    upload_worker = UploadWorker(BASE_DIR, FORGEON_API_URL, FORGEON_DEVICE_TOKEN)
+else:
+    logging.getLogger("rig.upload").info(
+        "Direct upload not configured (FORGEON_API_URL / FORGEON_DEVICE_TOKEN unset)"
+    )
 heartbeat = HeartbeatManager(base_dir=BASE_DIR, session_dir=SESSION_DIR)
 atexit.register(heartbeat.stop_sidecar)
 
@@ -4678,6 +4695,83 @@ def _get_heartbeat_files_info(rec_dir: Path) -> dict:
     # The heartbeat manager retains the original raw JSONL/status listing as
     # the fallback when no synchronized derivative is available.
     return heartbeat.files_info(rec_dir)
+
+
+VIEW_FIELD_MAPPING = {"side": "side_view", "front": "front_view", "back": "back_view", "top": "top_view"}
+
+
+def _upload_files_for_recording(rec_dir: Path) -> dict:
+    """Resolve the uploadable artifacts of a recording into API manifest fields.
+
+    Views come from the synced outputs (same files the browser flow downloads);
+    HR/insole are attached only when a non-empty synced derivative exists —
+    a 0-byte HR file (strap never connected) is skipped, mirroring the browser
+    flow's non-fatal handling.
+    """
+    files = {}
+    for semantic, info in _get_recording_files_info(rec_dir).items():
+        field = VIEW_FIELD_MAPPING.get(semantic)
+        if field:
+            files[field] = info["path"]
+    hr = rec_dir / "sync" / "heart_rate_sync.jsonl"
+    if hr.is_file() and hr.stat().st_size > 0:
+        files["hr_file"] = str(hr.relative_to(BASE_DIR))
+    insole = rec_dir / "sync" / "ble_sync.json"
+    if insole.is_file() and insole.stat().st_size > 0:
+        files["insole_file"] = str(insole.relative_to(BASE_DIR))
+    return files
+
+
+@app.route("/api/upload_instance", methods=["POST"])
+def api_upload_instance():
+    """Delegate an upload to the rig: enqueue recording N as assessment/instance.
+
+    Body: {assessment_id, instance_no, recording_index, parameters?,
+           activity_type?, total_instances?}
+    Enqueue is a local disk write — returns immediately, works offline.
+    """
+    if upload_worker is None:
+        return jsonify({"status": "error", "message": "Direct upload is not configured on this rig (set FORGEON_API_URL and FORGEON_DEVICE_TOKEN)."}), 503
+    body = request.get_json(silent=True) or {}
+    assessment_id = (body.get("assessment_id") or "").strip()
+    instance_no = body.get("instance_no")
+    rec_index = body.get("recording_index")
+    if not assessment_id or instance_no is None or rec_index is None:
+        return jsonify({"status": "error", "message": "assessment_id, instance_no and recording_index are required"}), 400
+    rec_dir = SESSION_DIR / f"recording_{int(rec_index)}"
+    if not rec_dir.exists():
+        return jsonify({"status": "not_found", "message": f"recording_{rec_index} not found"}), 404
+    files = _upload_files_for_recording(rec_dir)
+    if not any(f in ("front_view", "back_view", "side_view", "top_view") for f in files):
+        return jsonify({"status": "error", "message": "No synced camera files found for this recording — run sync first."}), 409
+    entry = upload_worker.enqueue(
+        assessment_id=assessment_id,
+        instance_no=int(instance_no),
+        recording_dir=str(rec_dir.relative_to(BASE_DIR)),
+        files=files,
+        parameters=body.get("parameters"),
+        activity_type=body.get("activity_type"),
+        total_instances=body.get("total_instances"),
+    )
+    return jsonify({"status": "queued", "entry": entry}), 202
+
+
+@app.route("/api/upload_queue", methods=["GET"])
+def api_upload_queue():
+    if upload_worker is None:
+        return jsonify({"status": "unconfigured", "entries": []}), 200
+    return jsonify({"status": "success", "entries": upload_worker.snapshot()}), 200
+
+
+@app.route("/api/upload_retry", methods=["POST"])
+def api_upload_retry():
+    if upload_worker is None:
+        return jsonify({"status": "error", "message": "Direct upload is not configured on this rig."}), 503
+    body = request.get_json(silent=True) or {}
+    entry = upload_worker.retry((body.get("assessment_id") or "").strip(), int(body.get("instance_no") or 0))
+    if entry is None:
+        return jsonify({"status": "not_found", "message": "No such queue entry"}), 404
+    return jsonify({"status": "success", "entry": entry}), 200
 
 
 @app.route("/download_file/<path:filepath>", methods=["GET"])
