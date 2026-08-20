@@ -25,7 +25,8 @@ through Forgeon API endpoints — the rig is a client like any other.
 ## 1. Identity & auth (Decision #9 becomes concrete here)
 
 - New forgeon table `rig_devices` (SQL migration): `id`, `name` (e.g. "office-rig"),
-  `token_hash` (sha256 of the device token, never plaintext), `organization_id`/site,
+  `token_hash` (sha256 of the device token, never plaintext), `lan_token` (the inbound
+  browser→rig token, retrievable — see §1b), `organization_id`/site,
   `created_at`, `last_seen_at`, `revoked_at`.
 - Admin API to issue/rotate/revoke device tokens (admin-authenticated; token plaintext shown
   once at issue time).
@@ -37,6 +38,29 @@ through Forgeon API endpoints — the rig is a client like any other.
 - Inbound-to-rig auth is separate and out of scope here: the V13 app already carries the
   (dormant) `RIG_API_TOKEN` gate from the hardening port for browser→rig calls on the LAN;
   enabling it is an operator decision once the record page can send the token.
+
+## 1b. Login & tokens (who logs in where — answer: only into forgeon)
+
+Three legs, no new logins anywhere:
+
+1. **Operator → forgeon frontend**: unchanged — the existing admin login/session. The operator
+   NEVER logs into the rig separately; the forgeon login is the only login in the system.
+2. **Browser → rig (LAN, `localhost:5000`)**: open today; the V13 app carries the dormant
+   `RIG_API_TOKEN` gate from the hardening port. When it is enabled, the record page must present
+   that token — delivery path: the token is stored in forgeon as `rig_devices.lan_token` and
+   handed to the record page by an admin-authenticated forgeon API call after login. The
+   operator's forgeon session therefore transitively authorizes rig access; nothing is typed on
+   the rig, nothing is hardcoded in the frontend. (Until the gate is enabled, this leg keeps
+   working with no token, exactly as today.)
+3. **Rig → forgeon API**: the device token (`FORGEON_DEVICE_TOKEN`, Bearer) per §1.
+
+**Two separate tokens, deliberately not one shared secret.** The inbound LAN token and the
+outbound device token differ in direction, blast radius, and rotation story: compromising the
+record page must not yield cloud-upload capability, and rotating the device token must not lock
+operators out of the rig page. Both are managed under the same `rig_devices` row so the admin UI
+shows one card per rig. The `lan_token` is retrievable by design (the browser must present it
+verbatim to the rig, and the rig compares it against its env) — acceptable because it only
+guards LAN access to the rig; the device token stays hash-only.
 
 ## 2. Upload path (reuse `upload-instance` semantics, don't fork them)
 
@@ -109,9 +133,30 @@ linked out-of-band: `recording_N ↔ assessment/instance` is recorded in the que
 ## 5. Browser flow after this
 
 Record page: stop recording → collect parameters → `POST rig /api/upload_instance` → poll
-`GET /api/upload_queue` and render per-instance progress. The current download-then-upload path
-(chunked) STAYS as a manual fallback button until the new path has run a full real session
-cleanly; then it demotes to a debug tool.
+`GET /api/upload_queue` and render per-instance progress (button contract in §5b). The current
+download-then-upload path (chunked) STAYS as a manual fallback button until the new path has run
+a full real session cleanly; then it demotes to a debug tool.
+
+## 5b. Record-page upload-button contract
+
+Per instance on the record page:
+
+- Click **Upload** → `POST rig /api/upload_instance` with the parameters + assessment/instance
+  identity. Enqueue is a local-disk write on the rig → returns ≲100 ms, even with no internet.
+- On 200 (queued) the button for THAT instance disables immediately and becomes a state chip —
+  the operator moves straight to the next delivery, zero wait.
+- Chip states come from the `GET /api/upload_queue` poll, keyed by
+  `(assessment_id, instance_no)`:
+  `Queued → Uploading (pct) → Verifying → Uploaded ✓`, and `Failed (reason)` which re-enables
+  the control as **Retry**.
+- Because state is keyed on identity and read from the rig's queue — not held in component
+  state — a page refresh, or a different laptop on the LAN, re-syncs every button. The tab is
+  no longer the source of truth for upload progress.
+- Double-click safety: enqueue is idempotent per `(assessment_id, instance_no)` — re-posting an
+  already-queued/uploading instance returns the existing entry, never a duplicate.
+- Re-record: re-recording an instance whose upload completed goes through the existing re-record
+  path (new recording → new enqueue, overwriting per today's upload-instance semantics); a
+  queued-but-not-started entry for that instance is replaced in the queue.
 
 ## Rollout phases (each its own PR, in order)
 
