@@ -1,6 +1,11 @@
 # Design — rig → cloud direct upload
 
-*Status: DESIGN, no code yet. 2026-08-20. Review before implementing any phase.*
+*Status: PHASES 2–4 BUILT, 2026-08-20. Phase 2 (forgeon API) E2E-verified on dev; phase 3
+(this repo, `upload_worker.py` + `/api/upload_*` routes, branch `feat/rig-upload-worker`) smoke-
+tested against a stub cloud; phase 4 (record-page delegate+poll, forgeon `feat/rig-direct-upload`)
+deployed to dev. Awaiting: one full live rig session (rollout step 5), then PRs/merges.
+Pairing flow (admin one-time code → rig fetches+stores its own token; no terminal, no password
+on the rig) agreed as the phase-5 enrollment UX — replaces `tools/rig_upload_test.py --register`.*
 *Absorbs checklist items R12 (auth enablement), R15 (stop-path worker), R20 (identity handshake), R23 (direct-to-cloud rescope).*
 
 ## Problem
@@ -160,13 +165,14 @@ Per instance on the record page:
 
 ## Rollout phases (each its own PR, in order)
 
-1. This design reviewed (user sign-off).
-2. forgeon: migration (`rig_devices`) + token admin API + `require_rig_device` + `/rig/instances/init|complete`
-   (+ the shared-code refactor of `upload_instance`). PR → dev; testable with `curl` end-to-end.
-3. streamer: upload worker + queue + routes; config gains `FORGEON_API_URL` + `FORGEON_DEVICE_TOKEN`.
-4. forgeon frontend: record page delegate + poll UI; fallback button kept.
-5. One full live session on the office rig via the new path → then enable retention (V14) and
-   consider flipping `RIG_API_TOKEN` on (browser sends it from the record page).
+1. ✅ Design reviewed (2026-08-20).
+2. ✅ forgeon API built + E2E on dev (branch `feat/rig-direct-upload`, migration applied to dev DB;
+   manual driver `tools/rig_upload_test.py` proved rig→GCS with real files).
+3. ✅ streamer worker + routes (branch `feat/rig-upload-worker`; env `FORGEON_API_URL` +
+   `FORGEON_DEVICE_TOKEN`; stub-cloud smoke: happy path, idempotency, backoff, `.uploaded` marker).
+4. ✅ record page delegate + poll + chips + silent browser fallback (deployed to dev).
+5. ⬜ One full live session on the office rig via the new path → then PRs/merges, retention (V14),
+   the pairing enrollment flow (phase 5), and eventually flipping `RIG_API_TOKEN` on.
 
 ## Non-goals / explicitly out
 
