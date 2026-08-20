@@ -3591,14 +3591,37 @@ mic = MicCaptureManager(
 # Unset -> the /api/upload_* routes answer 503 and nothing else changes.
 from upload_worker import UploadWorker
 
-FORGEON_API_URL = os.environ.get("FORGEON_API_URL", "").strip()
-FORGEON_DEVICE_TOKEN = os.environ.get("FORGEON_DEVICE_TOKEN", "").strip()
+# Credentials resolution order (docs §1b + phase-5 pairing):
+#   1. env FORGEON_API_URL + FORGEON_DEVICE_TOKEN (debug override)
+#   2. BASE_DIR/rig_device.json — written by the /pair flow, owned by the app.
+# Neither present -> not paired: upload routes 503, /pair page offers pairing.
+RIG_DEVICE_FILE = BASE_DIR / "rig_device.json"
+DEFAULT_FORGEON_API_URL = "https://api-dev-new.forgelabs.in/dev"
+
+
+def _load_rig_credentials():
+    api = os.environ.get("FORGEON_API_URL", "").strip()
+    tok = os.environ.get("FORGEON_DEVICE_TOKEN", "").strip()
+    if api and tok:
+        return {"api_url": api, "device_token": tok, "source": "env"}
+    try:
+        if RIG_DEVICE_FILE.is_file():
+            data = json.loads(RIG_DEVICE_FILE.read_text(encoding="utf-8"))
+            if data.get("api_url") and data.get("device_token"):
+                data["source"] = "file"
+                return data
+    except Exception:
+        logging.getLogger("rig.upload").exception("Could not read %s", RIG_DEVICE_FILE)
+    return None
+
+
 upload_worker = None
-if FORGEON_API_URL and FORGEON_DEVICE_TOKEN:
-    upload_worker = UploadWorker(BASE_DIR, FORGEON_API_URL, FORGEON_DEVICE_TOKEN)
+_rig_device_info = _load_rig_credentials()
+if _rig_device_info:
+    upload_worker = UploadWorker(BASE_DIR, _rig_device_info["api_url"], _rig_device_info["device_token"])
 else:
     logging.getLogger("rig.upload").info(
-        "Direct upload not configured (FORGEON_API_URL / FORGEON_DEVICE_TOKEN unset)"
+        "Not paired: no env credentials and no %s — pair via /pair", RIG_DEVICE_FILE.name
     )
 heartbeat = HeartbeatManager(base_dir=BASE_DIR, session_dir=SESSION_DIR)
 atexit.register(heartbeat.stop_sidecar)
@@ -4695,6 +4718,89 @@ def _get_heartbeat_files_info(rec_dir: Path) -> dict:
     # The heartbeat manager retains the original raw JSONL/status listing as
     # the fallback when no synchronized derivative is available.
     return heartbeat.files_info(rec_dir)
+
+
+@app.route("/api/pairing/status", methods=["GET"])
+def api_pairing_status():
+    return jsonify({
+        "paired": upload_worker is not None,
+        "name": (_rig_device_info or {}).get("name"),
+        "api_url": (_rig_device_info or {}).get("api_url"),
+        "source": (_rig_device_info or {}).get("source"),
+    }), 200
+
+
+@app.route("/api/pairing/claim", methods=["POST"])
+def api_pairing_claim():
+    """Exchange a one-time admin-minted code for this rig's tokens and store
+    them in rig_device.json (owned by the app; no .env, no terminal)."""
+    global upload_worker, _rig_device_info
+    body = request.get_json(silent=True) or {}
+    code = str(body.get("code") or "").strip()
+    api_url = str(body.get("api_url") or DEFAULT_FORGEON_API_URL).strip().rstrip("/")
+    if len(code) < 6:
+        return jsonify({"status": "error", "message": "Enter the pairing code from the Forgeon admin page."}), 400
+    try:
+        import urllib.request as _rq
+        req = _rq.Request(
+            f"{api_url}/rig/devices/claim",
+            data=json.dumps({"code": code}).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with _rq.urlopen(req, timeout=20) as resp:
+            claimed = json.loads(resp.read())
+    except Exception as exc:
+        detail = getattr(exc, "reason", None) or exc
+        try:
+            detail = json.loads(exc.read()).get("detail", str(exc))  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        rig_log.warning("Pairing claim failed: %s", detail)
+        return jsonify({"status": "error", "message": f"Pairing failed: {detail}"}), 502
+    info = {
+        "api_url": api_url,
+        "device_token": claimed["device_token"],
+        "lan_token": claimed.get("lan_token"),
+        "device_id": claimed.get("id"),
+        "name": claimed.get("name"),
+        "paired_at": datetime.now(timezone.utc).isoformat(),
+    }
+    RIG_DEVICE_FILE.write_text(json.dumps(info, indent=2), encoding="utf-8")
+    try:
+        os.chmod(RIG_DEVICE_FILE, 0o600)
+    except OSError:
+        pass
+    _rig_device_info = dict(info, source="file")
+    if upload_worker is None:
+        upload_worker = UploadWorker(BASE_DIR, api_url, claimed["device_token"])
+    rig_log.info("Paired with Forgeon as '%s' (%s)", info.get("name"), info.get("device_id"))
+    return jsonify({"status": "paired", "name": info.get("name"), "device_id": info.get("device_id")}), 200
+
+
+@app.route("/pair", methods=["GET"])
+def pairing_page():
+    """Self-contained pairing page — mint a code on the Forgeon admin
+    'Rig devices' page, type it here. No template file needed."""
+    return (
+        """<!doctype html><meta charset=utf-8><title>Pair this rig</title>
+<body style="font-family:system-ui;max-width:460px;margin:60px auto;padding:0 16px;color:#222">
+<h2>Pair this rig with Forgeon</h2>
+<p id=state style="color:#666">Checking…</p>
+<div id=form style="display:none">
+<p>Mint a code on the Forgeon admin → <b>Rig devices</b> page, then enter it:</p>
+<input id=code placeholder="XXXX-XXXX" style="font-family:monospace;font-size:24px;letter-spacing:3px;width:200px;text-transform:uppercase;padding:8px">
+<button onclick=claim() style="font-size:16px;padding:9px 18px;margin-left:8px">Pair</button>
+<p id=msg style="color:#b00"></p></div>
+<script>
+async function refresh(){const r=await fetch('/api/pairing/status');const d=await r.json();
+ if(d.paired){document.getElementById('state').textContent='Paired as “'+(d.name||'this rig')+'” → '+d.api_url+' ('+d.source+')';document.getElementById('form').style.display='none';}
+ else{document.getElementById('state').textContent='Not paired yet.';document.getElementById('form').style.display='block';}}
+async function claim(){const c=document.getElementById('code').value;const r=await fetch('/api/pairing/claim',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:c})});
+ const d=await r.json();if(r.ok){document.getElementById('msg').textContent='';refresh();}else{document.getElementById('msg').textContent=d.message||'Pairing failed';}}
+refresh();
+</script>"""
+    ), 200
 
 
 VIEW_FIELD_MAPPING = {"side": "side_view", "front": "front_view", "back": "back_view", "top": "top_view"}

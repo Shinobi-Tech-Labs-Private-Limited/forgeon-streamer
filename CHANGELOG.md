@@ -1,5 +1,13 @@
 # Changelog
 
+## V14-pre — pairing enrollment (2026-08-20, branch `feat/rig-upload-worker`)
+
+Phase 5: `/pair` page + `POST /api/pairing/claim` exchange an admin-minted
+one-time code (forgeon `/admin/rigs`) for this rig's tokens, stored in
+`rig_device.json` (git-ignored, 0600, owned by the app). Credential order:
+env override -> rig_device.json -> not paired (upload routes 503).
+No terminal, no .env, no password on the rig.
+
 ## V14-pre — direct-upload worker (2026-08-20, branch `feat/rig-upload-worker`)
 
 Phase 3 of docs/direct-upload-design.md: `upload_worker.py` (persistent queue at
