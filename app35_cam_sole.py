@@ -2,6 +2,7 @@ import asyncio
 import argparse
 import atexit
 import json
+import logging
 import os
 import platform
 import re
@@ -26,6 +27,7 @@ from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 from flask import Flask, Response, jsonify, redirect, render_template, request, send_from_directory, url_for
 from flask_cors import CORS
+from werkzeug.exceptions import HTTPException
 
 from heartbeat_manager import HeartbeatManager
 from intrinsic_calibrate_charuco import CalibrationCandidate, calibrate as calibrate_charuco, make_maps
@@ -49,12 +51,42 @@ except Exception as exc:
     FOCUS_MEASURE_ERROR = str(exc)
 
 # ==================== Camera Config ====================
+# Single source of truth for camera network topology. Every IP previously
+# appeared twice (CAMERA_SOURCES + CAMERA_BOOTSTRAP["host"]) with a third
+# implicit coupling to the v4l2rtspserver -u argument; hand-syncing those is
+# how rigs break when re-homed. Note the non-monotonic addressing is real:
+# cam2 = .33, cam3 = .32.
+CAMERA_HOSTS = {
+    "cam1": "192.168.2.30",
+    "cam2": "192.168.2.33",
+    "cam3": "192.168.2.32",
+}
+CAMERA_STREAM_ROLES = {"cam1": "side", "cam2": "front", "cam3": "back"}
 CAMERA_SOURCES = {
-    "cam1": "rtsp://192.168.2.30:8555/video0_side",
-    "cam2": "rtsp://192.168.2.33:8555/video0_front",
-    "cam3": "rtsp://192.168.2.32:8555/video0_back",
+    cam: f"rtsp://{CAMERA_HOSTS[cam]}:8555/video0_{CAMERA_STREAM_ROLES[cam]}"
+    for cam in CAMERA_HOSTS
 }
 CAMERA_SSH_USER = os.environ.get("PI_SSH_USER", "pi").strip() or "pi"
+
+# Host-key policy for SSH/scp to the camera Pis. The historical behavior
+# (StrictHostKeyChecking=no) trusts whoever answers at the IP — a swapped,
+# reflashed, or spoofed device connects silently. Default keeps that behavior
+# so a stock deploy is unaffected; once each Pi's host key is baked into
+# RIG_SSH_KNOWN_HOSTS (copy /etc/ssh/ssh_host_ed25519_key.pub at imaging time
+# over a trusted link), set RIG_SSH_STRICT=1 to pin identities. BatchMode makes
+# a missing/changed key fail fast instead of prompting into piped stdin and
+# hanging until the subprocess timeout.
+RIG_SSH_STRICT = os.environ.get("RIG_SSH_STRICT", "").strip().lower() in ("1", "true", "yes", "on")
+RIG_SSH_KNOWN_HOSTS = os.environ.get("RIG_SSH_KNOWN_HOSTS", "/etc/forgeon/known_hosts").strip()
+if RIG_SSH_STRICT:
+    CAMERA_SSH_OPTS = [
+        "-o", "StrictHostKeyChecking=yes",
+        "-o", f"UserKnownHostsFile={RIG_SSH_KNOWN_HOSTS}",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=5",
+    ]
+else:
+    CAMERA_SSH_OPTS = ["-o", "StrictHostKeyChecking=no"]
 CAMERA_BOOTSTRAP_ENABLED = os.environ.get("CAMERA_BOOTSTRAP_ENABLED", "1").strip().lower() not in (
     "0",
     "false",
@@ -66,8 +98,8 @@ CAMERA_BOOTSTRAP_HEALTHCHECK_SEC = 5.0
 CAMERA_BOOTSTRAP = {
     "cam1": {
         "name": "side camera",
-        "host": "192.168.2.30",
-        "stream_path": "video0_side",
+        "host": CAMERA_HOSTS["cam1"],
+        "stream_path": f"video0_{CAMERA_STREAM_ROLES['cam1']}",
         "command": [
             "v4l2rtspserver",
             "-v",
@@ -78,7 +110,7 @@ CAMERA_BOOTSTRAP = {
             "-P",
             "8555",
             "-u",
-            "side",
+            CAMERA_STREAM_ROLES["cam1"],
             "-f",
             "MJPG",
             "-W",
@@ -93,8 +125,8 @@ CAMERA_BOOTSTRAP = {
     },
     "cam2": {
         "name": "front camera",
-        "host": "192.168.2.33",
-        "stream_path": "video0_front",
+        "host": CAMERA_HOSTS["cam2"],
+        "stream_path": f"video0_{CAMERA_STREAM_ROLES['cam2']}",
         "command": [
             "v4l2rtspserver",
             "-v",
@@ -105,7 +137,7 @@ CAMERA_BOOTSTRAP = {
             "-P",
             "8555",
             "-u",
-            "front",
+            CAMERA_STREAM_ROLES["cam2"],
             "-f",
             "MJPG",
             "-W",
@@ -114,13 +146,17 @@ CAMERA_BOOTSTRAP = {
             "720",
             "-F",
             "90",
+            # NOTE: cam1/cam3 pass "-s /dev/video0" but cam2 passes a bare
+            # positional /dev/video0 — a live inconsistency on the deployed
+            # rig. Confirm the intended variant against the actual Pi before
+            # unifying; do not blindly copy one over the other.
             "/dev/video0",
         ],
     },
     "cam3": {
         "name": "back camera",
-        "host": "192.168.2.32",
-        "stream_path": "video0_back",
+        "host": CAMERA_HOSTS["cam3"],
+        "stream_path": f"video0_{CAMERA_STREAM_ROLES['cam3']}",
         "command": [
             "v4l2rtspserver",
             "-v",
@@ -131,7 +167,7 @@ CAMERA_BOOTSTRAP = {
             "-P",
             "8555",
             "-u",
-            "back",
+            CAMERA_STREAM_ROLES["cam3"],
             "-f",
             "MJPG",
             "-W",
@@ -230,10 +266,134 @@ CORS(
     ],
 )
 
+# Optional shared-token gate over the control/data surface. Every route is
+# otherwise anonymous on 0.0.0.0:5000 — anyone on the venue LAN can stop a
+# take mid-run, download every athlete's files, watch live previews, or drive
+# the mic SSH path. Default (unset) keeps today's open behavior so the legacy
+# operator UI is unaffected; set RIG_API_TOKEN on the rig and have clients send
+# "Authorization: Bearer <token>", "X-Rig-Token: <token>", or "?token=<token>"
+# (the query form exists so <img>/<video> tags can still reach /video_feed and
+# /media). CORS is not access control — curl on the LAN ignores it.
+RIG_API_TOKEN = os.environ.get("RIG_API_TOKEN", "").strip()
+_TOKEN_PROTECTED_PREFIXES = (
+    "/api/",
+    "/download_file/",
+    "/media/",
+    "/video_feed/",
+    "/status",
+    "/focus/",
+)
+
+
+@app.before_request
+def _require_rig_token():
+    if not RIG_API_TOKEN:
+        return None
+    if not request.path.startswith(_TOKEN_PROTECTED_PREFIXES):
+        return None
+    supplied = ""
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        supplied = auth_header[7:].strip()
+    supplied = supplied or request.headers.get("X-Rig-Token", "").strip() or request.args.get("token", "")
+    if supplied != RIG_API_TOKEN:
+        return jsonify({"status": "error", "message": "Missing or invalid rig token"}), 401
+    return None
+
+
 BASE_DIR = Path(__file__).resolve().parent
 SESSION_TIMESTAMP = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 SESSION_DIR = BASE_DIR / "sessions" / f"session_{SESSION_TIMESTAMP}"
 SESSION_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ==================== Rig Logging ====================
+# Per-subsystem log files inside the CURRENT session directory. The handler
+# resolves its target path on every emit because start_new_session() reassigns
+# the SESSION_DIR module global — a FileHandler bound at import would write to
+# the first session forever. File-append only: two BLE call sites emit from the
+# asyncio loop thread, where blocking/network handlers are not safe. Never log
+# RIG_API_TOKEN or other secrets.
+class SessionLogHandler(logging.Handler):
+    def __init__(self, path_provider):
+        super().__init__()
+        self._path_provider = path_provider
+        self._open_path = None
+        self._stream = None
+
+    def emit(self, record):
+        # Handler.handle() already serializes emit() under the handler lock.
+        try:
+            path = self._path_provider()
+            if path != self._open_path:
+                if self._stream is not None:
+                    self._stream.close()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                self._stream = open(path, "a", encoding="utf-8", buffering=1)
+                self._open_path = path
+            self._stream.write(self.format(record) + "\n")
+        except Exception:
+            self.handleError(record)
+
+    def close(self):
+        try:
+            if self._stream is not None:
+                self._stream.close()
+        finally:
+            self._stream = None
+            self._open_path = None
+            super().close()
+
+
+RIG_LOG_LEVEL = os.environ.get("RIG_LOG_LEVEL", "INFO").strip().upper()
+RIG_BLE_LOG_LEVEL = os.environ.get("RIG_BLE_LOG_LEVEL", "WARNING").strip().upper()
+_RIG_LOG_FORMAT = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+_RIG_LOG_SUBSYSTEMS = ("app", "sync", "ble", "mic", "heartbeat", "bootstrap")
+
+
+def _session_log_path(subsystem):
+    return lambda: SESSION_DIR / "logs" / f"{subsystem}.log"
+
+
+def _init_rig_logging():
+    root = logging.getLogger("rig")
+    if root.handlers:
+        return
+    root.setLevel(logging.DEBUG)
+    console = logging.StreamHandler()
+    console.setFormatter(_RIG_LOG_FORMAT)
+    console.setLevel(getattr(logging, RIG_LOG_LEVEL, logging.INFO))
+    root.addHandler(console)
+    for subsystem in _RIG_LOG_SUBSYSTEMS:
+        logger = logging.getLogger(f"rig.{subsystem}")
+        handler = SessionLogHandler(_session_log_path(subsystem))
+        handler.setFormatter(_RIG_LOG_FORMAT)
+        logger.addHandler(handler)
+        if subsystem == "ble":
+            # 200 Hz notify callbacks live behind this logger — WARNING keeps
+            # per-packet noise out unless an operator opts in.
+            logger.setLevel(getattr(logging, RIG_BLE_LOG_LEVEL, logging.WARNING))
+
+
+_init_rig_logging()
+rig_log = logging.getLogger("rig.app")
+sync_log = logging.getLogger("rig.sync")
+# Named ble_logger (not ble_log): stop_combined uses ble_log as a local for
+# the BLE stop-result dict.
+ble_logger = logging.getLogger("rig.ble")
+bootstrap_log = logging.getLogger("rig.bootstrap")
+
+
+def log_exception(logger, message):
+    logger.error(message, exc_info=True)
+
+
+@app.errorhandler(Exception)
+def _unhandled_error(exc):
+    if isinstance(exc, HTTPException):
+        return exc
+    log_exception(rig_log, f"Unhandled error in {request.path}")
+    return jsonify({"status": "error", "message": str(exc)}), 500
 CALIBRATION_DIR = SESSION_DIR / "calibration"
 CALIBRATION_JSON = CALIBRATION_DIR / "calibration_cam1.json"
 CALIBRATION_NPZ = CALIBRATION_DIR / "calibration_cam1.npz"
@@ -342,7 +502,7 @@ def _camera_backend_event(cam_key: str, message: str, *, state: str | None = Non
         events = list(status.get("recent_events", []))
         events.append(event)
         status["recent_events"] = events[-20:]
-    print(f"[camera-bootstrap][{cam_key}] {message}")
+    bootstrap_log.info("[%s] %s", cam_key, message)
 
 
 def _camera_backend_snapshot():
@@ -508,10 +668,7 @@ def _camera_log_line(cam_key: str, line: str):
 def _run_remote_camera_command(cam_key: str, command: str, timeout: float = 20):
     cfg = CAMERA_BOOTSTRAP[cam_key]
     target = f"{CAMERA_SSH_USER}@{cfg['host']}"
-    ssh_cmd = [
-        "ssh",
-        "-o",
-        "StrictHostKeyChecking=no",
+    ssh_cmd = ["ssh"] + CAMERA_SSH_OPTS + [
         target,
         "bash",
         "-s",
@@ -621,11 +778,7 @@ def lens_move(cam_key, steps, forward) -> tuple[dict, int]:
 def _run_remote_camera_ssh_debug(cam_key: str):
     cfg = CAMERA_BOOTSTRAP[cam_key]
     target = f"{CAMERA_SSH_USER}@{cfg['host']}"
-    ssh_cmd = [
-        "ssh",
-        "-vvv",
-        "-o",
-        "StrictHostKeyChecking=no",
+    ssh_cmd = ["ssh", "-vvv"] + CAMERA_SSH_OPTS + [
         target,
         "true",
     ]
@@ -834,7 +987,7 @@ def _monitor_camera_backend(cam_key: str):
 
 def start_camera_bootstrap():
     if not CAMERA_BOOTSTRAP_ENABLED:
-        print("[camera-bootstrap] Disabled by CAMERA_BOOTSTRAP_ENABLED")
+        bootstrap_log.info("Disabled by CAMERA_BOOTSTRAP_ENABLED")
         return
 
     for cam_key in CAMERA_BOOTSTRAP:
@@ -1014,7 +1167,13 @@ def best_record_decode_args() -> list:
 
 def best_record_encoder_args():
     sys_name = platform.system().lower()
-    common_out = ["-movflags", "+faststart", "-bf", "0"]
+    # No +faststart on the LIVE recording: it adds a second pass at stop that
+    # rewrites the entire file to front-load the moov atom, and a SIGKILL
+    # landing mid-rewrite corrupts the whole MP4. The raw recording is an
+    # ffmpeg-only intermediate — run_sync_on_dir() unconditionally re-encodes
+    # every camera with best_sync_encoder_args(), which keeps +faststart on the
+    # outputs that are actually served/uploaded.
+    common_out = ["-bf", "0"]
 
     if (
         sys_name in ("linux", "windows")
@@ -1281,8 +1440,8 @@ def run_sync_on_dir(recording_dir: Path):
             available[cam] = {"start": st, "path": vid_file}
 
     if not available:
-        message = "No cameras with video and start times were found"
-        print(f"[sync] {message}. Skipping sync.")
+        message = "Need at least 1 camera with video and start time; found 0"
+        sync_log.warning("%s. Skipping sync.", message)
         result = {"ok": False, "message": message, "successful_cameras": [], "warnings": [message]}
         (sync_dir / "sync_manifest.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         return result
@@ -1329,7 +1488,7 @@ def run_sync_on_dir(recording_dir: Path):
             except Exception as exc:
                 result["heart_rate"] = {"ok": False, "message": f"Heart-rate synchronization failed: {exc}"}
         (sync_dir / "sync_manifest.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
-        print(f"[sync] {message}: {out_path}")
+        sync_log.info("[sync] %s: %s", message, out_path)
         return result
 
     starts = {cam: info["start"] for cam, info in available.items()}
@@ -1375,18 +1534,27 @@ def run_sync_on_dir(recording_dir: Path):
             "-vf",
             f"fps={common_fps:.6f},setpts=PTS-STARTPTS",
         ] + best_sync_encoder_args() + [str(out_path)]
-        procs.append((cam, subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)))
+        # Keep ffmpeg's full output beside the synced file: with stderr sent to
+        # DEVNULL a failed re-encode was undiagnosable in principle — only the
+        # return code survived.
+        sync_logf = open(sync_dir / f"{cam}_sync.log", "w", buffering=1)
+        sync_logf.write("CMD: " + " ".join(cmd) + "\n")
+        procs.append((cam, subprocess.Popen(cmd, stdout=sync_logf, stderr=sync_logf), sync_logf))
 
     successful = []
     failures = []
-    for cam, p in procs:
+    for cam, p, sync_logf in procs:
         rc = p.wait()
+        try:
+            sync_logf.close()
+        except Exception:
+            pass
         if rc != 0:
-            print(f"[sync] {cam} re-encode exited with code {rc}")
+            sync_log.error("%s re-encode exited with code %s; see sync/%s_sync.log", cam, rc, cam)
             failures.append({"camera": cam, "returncode": rc})
         else:
             successful.append(cam)
-    print(f"[sync] re-encoded {len(procs)} cameras in {time.time() - t0:.2f}s")
+    sync_log.info("re-encoded %d cameras in %.2fs", len(procs), time.time() - t0)
 
     output_durations = []
     for cam in successful:
@@ -1549,6 +1717,21 @@ def focus_payload_for_camera(cam_key, target="cube"):
     frame = latest_frame_copy(cam_key)
     if frame is None:
         return {"error": "no frame"}, 503
+
+    # frames[] keeps the last decoded frame forever, so a wedged stream would
+    # still be scored - and a frozen board reads SHARP while /status on the
+    # same page says preview_healthy: false. Gate on the same age predicate.
+    # Distinct label + color: UNAVAILABLE/NO BOARD grey must not absorb this.
+    if not _preview_is_healthy(cam_key):
+        return {
+            "detected": False,
+            "score": None,
+            "label": "STALE",
+            "color": "#b45309",
+            "corners": 0,
+            "error": "preview frame is stale; the camera stream appears frozen",
+        }, 503
+
     if target not in ("cube", "board"):
         return {"error": "focus target must be cube or board"}, 400
     return measure_frame(frame, FOCUS_TRACKER, cam_key, target=target), 200
@@ -1606,51 +1789,80 @@ def start_recording_all():
     if REQUIRE_CUDA_RECORD and not cuda_ok:
         raise RuntimeError("CUDA is required for recording, but FFmpeg CUDA init failed in this runtime.")
 
-    print(
-        f"[record] CUDA probe={'OK' if cuda_ok else 'FAIL'} "
-        f"force_cuda={FORCE_CUDA_RECORD} require_cuda={REQUIRE_CUDA_RECORD}"
+    rig_log.info(
+        "[record] CUDA probe=%s force_cuda=%s require_cuda=%s",
+        "OK" if cuda_ok else "FAIL",
+        FORCE_CUDA_RECORD,
+        REQUIRE_CUDA_RECORD,
     )
 
     recording_index += 1
     current_recording_dir = SESSION_DIR / f"recording_{recording_index}"
     current_recording_dir.mkdir(parents=True, exist_ok=True)
 
-    is_recording_evt.set()
     recording_start_epoch = time.time()
     record_procs = {}
     record_logs = {}
 
-    for cam_key, src in CAMERA_SOURCES.items():
-        out_path = current_recording_dir / f"{cam_key}.mp4"
-        log_path = current_recording_dir / f"{cam_key}.log"
-        cmd = build_ffmpeg_record_cmd(src, out_path)
+    try:
+        for cam_key, src in CAMERA_SOURCES.items():
+            out_path = current_recording_dir / f"{cam_key}.mp4"
+            log_path = current_recording_dir / f"{cam_key}.log"
+            cmd = build_ffmpeg_record_cmd(src, out_path)
 
-        logf = open(log_path, "w", buffering=1)
-        record_logs[cam_key] = logf
-        logf.write("CMD: " + " ".join(cmd) + "\n")
-        if "h264_nvenc" in cmd:
-            logf.write("BACKEND: nvenc\n")
-        elif "libx264" in cmd:
-            logf.write("BACKEND: libx264\n")
-        if "mjpeg_cuvid" in cmd:
-            logf.write("DECODE: mjpeg_cuvid\n")
-        else:
-            logf.write("DECODE: software\n")
-        print(f"[{cam_key}] ▶ FFmpeg recording started -> {out_path}")
-        print(f"[{cam_key}] Log: {log_path}")
+            logf = open(log_path, "w", buffering=1)
+            record_logs[cam_key] = logf
+            logf.write("CMD: " + " ".join(cmd) + "\n")
+            if "h264_nvenc" in cmd:
+                logf.write("BACKEND: nvenc\n")
+            elif "libx264" in cmd:
+                logf.write("BACKEND: libx264\n")
+            if "mjpeg_cuvid" in cmd:
+                logf.write("DECODE: mjpeg_cuvid\n")
+            else:
+                logf.write("DECODE: software\n")
+            rig_log.info("[%s] FFmpeg recording started -> %s (log: %s)", cam_key, out_path, log_path)
 
-        p = subprocess.Popen(cmd, stdout=logf, stderr=logf, cwd=str(BASE_DIR))
-        record_procs[cam_key] = p
-        time.sleep(0.3)
-        if p.poll() is not None:
-            print(f"[{cam_key}] FFmpeg exited immediately with code {p.returncode}. See {log_path}")
+            p = subprocess.Popen(cmd, stdout=logf, stderr=logf, cwd=str(BASE_DIR))
+            record_procs[cam_key] = p
+            time.sleep(0.3)
+            if p.poll() is not None:
+                rig_log.error("[%s] FFmpeg exited immediately with code %s. See %s", cam_key, p.returncode, log_path)
 
-    alive = [p for p in record_procs.values() if p and p.poll() is None]
-    if not alive:
-        raise RuntimeError(
-            "All FFmpeg recording processes exited immediately. "
-            "Check cam*.log in the recording folder for details."
-        )
+        alive = [p for p in record_procs.values() if p and p.poll() is None]
+        if not alive:
+            raise RuntimeError(
+                "All FFmpeg recording processes exited immediately. "
+                "Check cam*.log in the recording folder for details."
+            )
+    except Exception:
+        # Roll back everything this start spawned. Without this, a failure on
+        # camera N leaves cameras 1..N-1's encoders running - and the next
+        # start reassigns record_procs, dropping the last handle to those PIDs
+        # so they can only be killed from a shell.
+        log_exception(rig_log, "Recording start failed; rolling back spawned encoders")
+        for _, p in list(record_procs.items()):
+            if p and p.poll() is None:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+        for _, logf in list(record_logs.items()):
+            try:
+                logf.flush()
+                logf.close()
+            except Exception:
+                pass
+        record_procs = {}
+        record_logs = {}
+        raise
+
+    # Only mark the rig as recording once at least one encoder is confirmed
+    # alive. Setting the flag before the spawn loop meant any start failure
+    # left it stuck: /status reported recording, retrying Start returned a
+    # success-shaped "already_recording", and only pressing Stop (which then
+    # sync/validated an empty folder) recovered the rig.
+    is_recording_evt.set()
 
 
 def _snap_output_dir() -> Path:
@@ -2315,6 +2527,25 @@ def validate_recording(recording_dir: Path) -> dict:
                     raw = wav_file.readframes(min(frame_count, sample_rate * 30))
                 add("audio", "decodable", frame_count > 0 and sample_rate > 0, mic_expected,
                     f"Audio is decodable ({audio_duration:.3f}s, {sample_rate}Hz, {channels} channel(s))")
+                # A force-killed capture (deadlock, OOM, power cut) leaves the
+                # header declaring the size of the FIRST write (~10 ms) while
+                # the whole take sits in the file — and 512 frames passes a
+                # bare frame_count > 0 test. Compare the declared data size
+                # against the bytes actually on disk.
+                declared_bytes = frame_count * sample_width * channels
+                actual_bytes = max(0, wav_path.stat().st_size - 44)
+                header_ok = actual_bytes <= declared_bytes + 4096
+                est_duration = (
+                    actual_bytes / (sample_width * channels * sample_rate)
+                    if (sample_width and channels and sample_rate)
+                    else 0.0
+                )
+                add("audio", "header_length", header_ok, mic_expected,
+                    "WAV header length matches the file" if header_ok else
+                    f"WAV header declares {audio_duration:.3f}s but the file holds ~{est_duration:.1f}s — "
+                    "the capture was force-killed mid-write. The audio is intact and recoverable by "
+                    "repairing the header's two length fields; do NOT delete this file",
+                    {"declared_data_bytes": declared_bytes, "actual_data_bytes": actual_bytes})
                 coverage_ok = duration <= 0 or audio_duration >= duration * 0.95
                 add("audio", "coverage", coverage_ok, mic_expected,
                     f"Audio duration covers {(audio_duration / duration * 100) if duration else 0:.1f}% of synchronized video",
@@ -2377,10 +2608,14 @@ def stop_recording_all(process_outputs: bool = True):
             except Exception:
                 pass
 
-    t_end = time.time() + 15.0
     for _, p in list(record_procs.items()):
         if p is None:
             continue
+        # Per-camera grace: each encoder gets its own 15 s. The +faststart moov
+        # rewrites run concurrently and compete for the disk, so a shared
+        # wall-clock stamp lets one slow camera exhaust the budget and get the
+        # others SIGKILLed mid-rewrite (corrupting their MP4s).
+        t_end = time.time() + 15.0
         while time.time() < t_end:
             if p.poll() is not None:
                 break
@@ -2440,6 +2675,51 @@ class InsoleDevice:
         self._raw_buffer = bytearray()
         self._buffer_lock = Lock()
 
+        # Write-ahead log: every accepted sample is appended to disk as it
+        # arrives, so a crash/OOM/power cut costs at most ~1 s of tail instead
+        # of the whole take. (Heart rate already works this way via its sidecar
+        # JSONL; insoles were RAM-only until stop.)
+        self._wal_file = None
+        self._wal_path = None
+        self._wal_last_fsync = 0.0
+        self.wal_errors = 0
+
+    def set_wal(self, path: Path):
+        with self._buffer_lock:
+            self._close_wal_locked()
+            self._wal_path = path
+            self._wal_file = open(path, "ab")
+            self._wal_last_fsync = time.time()
+
+    def _close_wal_locked(self):
+        if self._wal_file:
+            try:
+                self._wal_file.flush()
+                os.fsync(self._wal_file.fileno())
+            except Exception:
+                pass
+            try:
+                self._wal_file.close()
+            except Exception:
+                pass
+            self._wal_file = None
+
+    def close_wal(self):
+        with self._buffer_lock:
+            self._close_wal_locked()
+
+    def remove_wal(self):
+        # Call only after the decoded JSON is durably on disk — the WAL is the
+        # sole copy of this take's samples until then.
+        with self._buffer_lock:
+            self._close_wal_locked()
+            if self._wal_path:
+                try:
+                    os.unlink(self._wal_path)
+                except OSError:
+                    pass
+                self._wal_path = None
+
     async def connect(self):
         if self.connected and self.client:
             return True
@@ -2468,7 +2748,7 @@ class InsoleDevice:
                     continue
                 break
 
-        print(f"[BLE] Connect failed {self.address}: {last_err}")
+        ble_logger.error("Connect failed %s: %s", self.address, last_err)
         return False
 
     def _on_disconnect(self, client):
@@ -2588,6 +2868,19 @@ class InsoleDevice:
             self._raw_buffer = bytearray()
         return out
 
+    def get_raw_data(self):
+        # Non-destructive read: stop_logging() decodes from this and clears
+        # only AFTER the JSON is durably written. The old clear-then-serialize
+        # order destroyed the RAM copy before anything reached disk, so any
+        # exception in between (MemoryError, corrupt timestamp, disk full)
+        # silently lost the take's pressure data.
+        with self._buffer_lock:
+            return bytes(self._raw_buffer)
+
+    def clear_raw_data(self):
+        with self._buffer_lock:
+            self._raw_buffer = bytearray()
+
     def _handle_status(self, sender, data):
         if len(data) < 8:
             return
@@ -2604,6 +2897,7 @@ class InsoleDevice:
         host_ts = time.time()
         self.notify_count += 1
         with self._buffer_lock:
+            wal_chunk = bytearray()
             for i in range(num_samples):
                 packet = data[i * SINGLE_SAMPLE_SIZE : (i + 1) * SINGLE_SAMPLE_SIZE]
                 payload = packet[:18]
@@ -2628,8 +2922,23 @@ class InsoleDevice:
                         "packet_id": self.packet_count,
                     }
                 )
-                self._raw_buffer.extend(struct.pack("<d", host_ts))
-                self._raw_buffer.extend(packet)
+                record = struct.pack("<d", host_ts) + packet
+                self._raw_buffer.extend(record)
+                wal_chunk.extend(record)
+
+            if self._wal_file and wal_chunk:
+                try:
+                    self._wal_file.write(wal_chunk)
+                    self._wal_file.flush()
+                    # fsync on a ~1 s cadence only: this callback runs on the
+                    # BLE asyncio loop thread, and per-notify fsync latency
+                    # would drop notifications. flush() to the page cache is
+                    # cheap; fsync bounds the loss window to about a second.
+                    if host_ts - self._wal_last_fsync >= 1.0:
+                        os.fsync(self._wal_file.fileno())
+                        self._wal_last_fsync = host_ts
+                except Exception:
+                    self.wal_errors += 1
 
 
 class BleCoordinator:
@@ -2989,15 +3298,39 @@ class BleCoordinator:
 
         ble_dir = rec_dir / "ble"
         ble_dir.mkdir(parents=True, exist_ok=True)
+
+        # Persist the frozen L/R assignment map BEFORE any samples land. It
+        # otherwise lives only in RAM and dies with a crash, so WAL recovery
+        # could not tell which foot a WAL belongs to.
+        assignments_path = ble_dir / f"assignments_recording_{rec_idx}.json"
+        try:
+            assignments_path.write_text(json.dumps(self.recording_assignments), encoding="utf-8")
+        except Exception as exc:
+            ble_logger.error("Failed to persist assignment map: %s", exc)
+
+        # Arm a per-device WAL. Per-device files are required: the 28-byte
+        # frame carries no device identity, so a shared file could not be
+        # attributed on recovery. Armed only from start_logging, so the WAL is
+        # never polluted with pre-roll from the free-running stream.
+        for dev in self.devices.values():
+            try:
+                dev.set_wal(ble_dir / f"wal_recording_{rec_idx}_{dev.address.replace(':', '-')}.bin")
+            except Exception as exc:
+                ble_logger.error("Failed to arm WAL for %s: %s", dev.address, exc)
+
         self.current_log_file = ble_dir / f"insole_log_recording_{rec_idx}.json"
         self.logging_active = True
         if discarded_samples:
-            print(f"[BLE] Discarded {discarded_samples} pre-recording samples")
+            ble_logger.warning("Discarded %d pre-recording samples", discarded_samples)
 
     def stop_logging(self):
         self.logging_active = False
         if not self.current_log_file:
             return {"ok": False, "message": "No target file"}
+
+        # Seal the WALs first so their tails are flushed before decode.
+        for dev in self.devices.values():
+            dev.close_wal()
 
         assignments = dict(self.recording_assignments)
         output = {"Assignments": assignments, "Left": [], "Right": [], "Unassigned": []}
@@ -3023,14 +3356,17 @@ class BleCoordinator:
                 devices_to_dump.append(dev)
                 seen.add(dev.address)
 
+        side_by_address = {address: side for side, address in assignments.items()}
         for dev in devices_to_dump:
-            raw_data = dev.get_raw_data_and_clear()
+            # Decode from a non-destructive copy — buffers and WALs are cleared
+            # only after the JSON is durably on disk (below), so a failure
+            # anywhere in between leaves the data recoverable.
+            raw_data = dev.get_raw_data()
             if not raw_data:
                 continue
 
             record_size = 28
             num_records = len(raw_data) // record_size
-            side_by_address = {address: side for side, address in assignments.items()}
             recorded_side = side_by_address.get(dev.address)
             bucket = recorded_side if recorded_side in ("Left", "Right") else "Unassigned"
             for i in range(num_records):
@@ -3054,9 +3390,27 @@ class BleCoordinator:
 
         total_entries = len(output["Left"]) + len(output["Right"]) + len(output["Unassigned"])
         if total_entries == 0:
+            # Nothing captured — the empty WALs carry nothing worth recovering.
+            for dev in self.devices.values():
+                dev.remove_wal()
             return {"ok": False, "message": "No BLE data to save"}
 
-        self.current_log_file.write_text(json.dumps(output, indent=2), encoding="utf-8")
+        # Durable write: temp file + fsync + atomic replace, so a crash mid-dump
+        # can never leave a half-written JSON masquerading as the take's log.
+        # (indent dropped — a ten-minute two-sole take is ~240k entries and the
+        # pretty-printed string roughly doubles the stop-time memory spike.)
+        tmp_path = self.current_log_file.with_name(self.current_log_file.name + ".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(output, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, self.current_log_file)
+
+        # JSON is durable — now the RAM copies and WALs can go.
+        for dev in self.devices.values():
+            dev.clear_raw_data()
+            dev.remove_wal()
+
         stat = self.current_log_file.stat()
         return {
             "ok": True,
@@ -3088,6 +3442,7 @@ class BleCoordinator:
                         "packet_count": d.packet_count,
                         "notify_count": d.notify_count,
                         "crc_errors": d.crc_errors,
+                        "wal_errors": d.wal_errors,
                         "sample_count": d.sample_count,
                         "samples_per_notify": SAMPLES_PER_NOTIFY,
                         "last_packet_time": d.last_packet_time,
@@ -3117,6 +3472,107 @@ class BleCoordinator:
                 "total_packets": total_packets,
                 "session_dir": str(self.session_dir.relative_to(BASE_DIR)),
             }
+
+
+def recover_ble_wals(sessions_root: Path) -> int:
+    """Decode orphaned insole WALs left behind by a crash into their JSON logs.
+
+    A WAL survives only when the app died between samples arriving and
+    stop_logging()'s durable write. Each WAL lives inside its own recording's
+    ble/ folder next to the persisted assignment map, so the decoded JSON lands
+    in the correct (old) take even though SESSION_DIR has since moved on.
+    Returns the number of recovered log files.
+    """
+    recovered = 0
+    if not sessions_root.exists():
+        return 0
+    try:
+        wal_paths = sorted(sessions_root.glob("session_*/recording_*/ble/wal_recording_*.bin"))
+    except OSError:
+        return 0
+
+    groups = {}  # (ble_dir, rec_idx) -> [(address, wal_path), ...]
+    for wal_path in wal_paths:
+        parts = wal_path.stem.split("_")  # wal_recording_{idx}_{AA-BB-...}
+        if len(parts) < 4:
+            continue
+        rec_idx, address = parts[2], "_".join(parts[3:]).replace("-", ":")
+        groups.setdefault((wal_path.parent, rec_idx), []).append((address, wal_path))
+
+    for (ble_dir, rec_idx), members in groups.items():
+        json_path = ble_dir / f"insole_log_recording_{rec_idx}.json"
+        if json_path.exists():
+            # The dump succeeded and only the cleanup was lost — WALs are stale.
+            for _, wal_path in members:
+                try:
+                    os.unlink(wal_path)
+                except OSError:
+                    pass
+            continue
+
+        assignments = {}
+        assignments_path = ble_dir / f"assignments_recording_{rec_idx}.json"
+        if assignments_path.exists():
+            try:
+                assignments = json.loads(assignments_path.read_text(encoding="utf-8")) or {}
+            except Exception:
+                assignments = {}
+        side_by_address = {address: side for side, address in assignments.items()}
+
+        output = {
+            "Assignments": assignments,
+            "Left": [],
+            "Right": [],
+            "Unassigned": [],
+            "Recovered_From_WAL": True,
+        }
+        packet_id = 0
+        for address, wal_path in members:
+            try:
+                raw_data = wal_path.read_bytes()
+            except OSError:
+                continue
+            recorded_side = side_by_address.get(address)
+            bucket = recorded_side if recorded_side in ("Left", "Right") else "Unassigned"
+            record_size = 28
+            for i in range(len(raw_data) // record_size):
+                record = raw_data[i * record_size : (i + 1) * record_size]
+                timestamp = struct.unpack("<d", record[0:8])[0]
+                dev_ts = struct.unpack("<H", record[8:10])[0]
+                channels = struct.unpack("<8H", record[10:26])
+                packet_id += 1
+                output[bucket].append(
+                    {
+                        "Timestamp": datetime.fromtimestamp(timestamp).isoformat(),
+                        "Device_TS_ms": dev_ts,
+                        "Packet_ID": packet_id,
+                        "Device_Address": address,
+                        "Device_Name": address,
+                        "Device_Side": recorded_side,
+                        "Channels": {f"Ch{j}": int(val) for j, val in enumerate(channels)},
+                    }
+                )
+
+        total_entries = len(output["Left"]) + len(output["Right"]) + len(output["Unassigned"])
+        if total_entries:
+            try:
+                tmp_path = json_path.with_name(json_path.name + ".tmp")
+                with open(tmp_path, "w", encoding="utf-8") as fh:
+                    json.dump(output, fh)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_path, json_path)
+                recovered += 1
+                ble_logger.warning("Recovered %d insole samples from WAL -> %s", total_entries, json_path)
+            except Exception as exc:
+                ble_logger.error("WAL recovery failed for %s: %s", json_path, exc)
+                continue  # keep the WALs for a manual pass
+        for _, wal_path in members:
+            try:
+                os.unlink(wal_path)
+            except OSError:
+                pass
+    return recovered
 
 
 ble = BleCoordinator(SESSION_DIR)
@@ -3271,6 +3727,7 @@ def stop_combined():
     mic_stop_error = None
     heartbeat_log = None
     heartbeat_stop_error = None
+    heartbeat_warning = None
 
     # Finalize the raw camera files first. BLE and heart-rate capture remain
     # active during this short shutdown so their data brackets the video end.
@@ -3280,11 +3737,13 @@ def stop_combined():
     try:
         ble.stop_streaming()
     except Exception as e:
+        log_exception(ble_logger, "BLE stream stop failed during stop_combined")
         ble_stop_error = str(e)
     try:
         if ble.logging_active:
             ble_log = ble.stop_logging()
     except Exception as e:
+        log_exception(ble_logger, "BLE logging stop failed during stop_combined")
         message = str(e)
         ble_stop_error = f"{ble_stop_error}; {message}" if ble_stop_error else message
 
@@ -3292,7 +3751,17 @@ def stop_combined():
         heartbeat_log = heartbeat.stop_snippet(current_recording_dir)
         if heartbeat_log and not heartbeat_log.get("ok") and not heartbeat_log.get("skipped"):
             heartbeat_stop_error = heartbeat_log.get("message") or "Heartbeat snippet stop failed"
+        elif heartbeat_log and not heartbeat_log.get("skipped") and heartbeat_log.get("sample_count") == 0:
+            # The manager's ok flag does not gate on sample count, so a take
+            # with zero HR samples otherwise reports full success. Surface it
+            # as a distinct warning — NOT as an error, which would flag every
+            # deliberate no-strap take as a rig failure.
+            heartbeat_warning = (
+                "Heartbeat capture returned 0 samples for this take "
+                "(strap off, out of range, or sidecar restarted)"
+            )
     except Exception as e:
+        log_exception(logging.getLogger("rig.heartbeat"), "Heartbeat snippet stop failed during stop_combined")
         heartbeat_stop_error = str(e)
 
     try:
@@ -3300,6 +3769,7 @@ def stop_combined():
         if mic_log and not mic_log.get("ok") and not mic_log.get("skipped"):
             mic_stop_error = "; ".join(mic_log.get("errors") or [mic_log.get("message") or "Mic stop failed"])
     except Exception as e:
+        log_exception(logging.getLogger("rig.mic"), "Mic stop failed during stop_combined")
         mic_stop_error = str(e)
 
     if current_recording_dir and current_recording_dir.exists():
@@ -3329,6 +3799,8 @@ def stop_combined():
         out["mic_error"] = mic_stop_error
     if heartbeat_stop_error:
         out["heartbeat_error"] = heartbeat_stop_error
+    if heartbeat_warning:
+        out["heartbeat_warning"] = heartbeat_warning
     return out
 
 
@@ -3527,11 +3999,16 @@ def capture_photos_route():
 @app.route("/media/<path:filepath>", methods=["GET"])
 def media_file(filepath):
     try:
-        file_path = BASE_DIR / filepath
-        if not str(file_path.resolve()).startswith(str(BASE_DIR.resolve())):
+        # is_relative_to, not startswith: a bare string-prefix check admits
+        # sibling paths that share the directory-name prefix (e.g.
+        # <BASE_DIR>_backup), which a %2e%2e-encoded request can reach.
+        file_path = (BASE_DIR / filepath).resolve()
+        if not file_path.is_relative_to(BASE_DIR.resolve()):
             return jsonify({"status": "error", "message": "Invalid file path"}), 403
         if not file_path.exists():
             return jsonify({"status": "error", "message": "File not found"}), 404
+        # file_path is fully resolved, so send_from_directory receives a parent
+        # with no ".." components left for its own safe_join to mis-handle.
         return send_from_directory(str(file_path.parent), file_path.name, as_attachment=False)
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -3552,7 +4029,10 @@ def status():
             "sport_options": sport_options_for_template(),
             "calibration_required": calibration_required(),
             "ffmpeg_in_path": bool(shutil.which("ffmpeg")),
+            "focus_measure_available": FOCUS_MEASURE_AVAILABLE,
+            "focus_measure_error": FOCUS_MEASURE_ERROR,
             "session_dir": str(SESSION_DIR.relative_to(BASE_DIR)),
+            "log_dir": str((SESSION_DIR / "logs").relative_to(BASE_DIR)),
             "camera_bootstrap_enabled": CAMERA_BOOTSTRAP_ENABLED,
             "camera_bootstrap": _camera_backend_snapshot(),
             "camera_status": camera_status,
@@ -3618,8 +4098,8 @@ def api_calibration_upload_json():
         else:
             body = request.get_json(silent=True) or {}
             if body.get("path"):
-                src = BASE_DIR / body["path"]
-                if not str(src.resolve()).startswith(str(BASE_DIR.resolve())):
+                src = (BASE_DIR / body["path"]).resolve()
+                if not src.is_relative_to(BASE_DIR.resolve()):
                     return jsonify({"status": "error", "message": "Invalid calibration JSON path"}), 403
                 data = json.loads(src.read_text(encoding="utf-8"))
             else:
@@ -3869,9 +4349,17 @@ def api_heartbeat_device():
 
 @app.route("/api/heartbeat/devices", methods=["POST"])
 def api_heartbeat_devices():
+    if is_recording_evt.is_set():
+        return jsonify({
+            "status": "recording_active",
+            "message": "Recording in progress; a BLE device scan suspends heart-rate "
+                       "notifications and would punch a hole in this take's HR data. "
+                       "Stop the recording first.",
+        }), 409
     try:
         return jsonify({"status": "success", **heartbeat.devices()}), 200
     except Exception as e:
+        log_exception(logging.getLogger("rig.heartbeat"), "Heartbeat device scan failed")
         return jsonify({"status": "error", "detail": "Heartbeat device scan failed", "message": str(e)}), 502
 
 
@@ -3884,6 +4372,7 @@ def api_heartbeat_connect():
     try:
         return jsonify({"status": "success", **heartbeat.connect_device(device)}), 200
     except Exception as e:
+        log_exception(logging.getLogger("rig.heartbeat"), "Heartbeat device connect failed")
         return jsonify({"status": "error", "detail": "Heartbeat device connect failed", "message": str(e)}), 502
 
 
@@ -3892,6 +4381,7 @@ def api_heartbeat_disconnect():
     try:
         return jsonify({"status": "success", **heartbeat.disconnect_device()}), 200
     except Exception as e:
+        log_exception(logging.getLogger("rig.heartbeat"), "Heartbeat device disconnect failed")
         return jsonify({"status": "error", "detail": "Heartbeat device disconnect failed", "message": str(e)}), 502
 
 
@@ -3943,6 +4433,15 @@ def api_ble_add_device():
 
 @app.route("/api/ble/remove_device", methods=["POST"])
 def api_ble_remove_device():
+    # Removing a device mid-take pops it from the coordinator, so stop_logging
+    # skips it and that foot's pressure data vanishes with no error.
+    if is_recording_evt.is_set():
+        return jsonify(
+            {
+                "status": "recording_active",
+                "message": "Recording in progress; removing an insole now would silently drop that foot's pressure data. Stop the recording first.",
+            }
+        ), 409
     data = request.get_json(silent=True) or {}
     address = data.get("address")
     if not address:
@@ -4019,6 +4518,17 @@ def api_ble_set_frequency():
 
 @app.route("/api/ble/start_stream", methods=["POST"])
 def api_ble_start_stream():
+    # Guard BEFORE any BLE work: re-arming mid-take clears the buffer and
+    # recomputes the same deterministic log filename, so the dump at stop
+    # would overwrite the take's earlier segment — losing the beginning AND
+    # the middle of the pressure data.
+    if is_recording_evt.is_set():
+        return jsonify(
+            {
+                "status": "recording_active",
+                "message": "Recording in progress; re-arming the insole stream would overwrite this take's pressure log. Stop the recording first.",
+            }
+        ), 409
     try:
         detail = ble.start_streaming()
         if is_recording_evt.is_set() and current_recording_dir is not None:
@@ -4037,6 +4547,16 @@ def api_ble_start_stream():
 
 @app.route("/api/ble/stop_stream", methods=["POST"])
 def api_ble_stop_stream():
+    # Guard at the top of the handler: stop_streaming() is a no-op when
+    # already stopped, so a check placed after it would still let stop_logging
+    # truncate a live recording's insole log.
+    if is_recording_evt.is_set():
+        return jsonify(
+            {
+                "status": "recording_active",
+                "message": "Recording in progress; stopping the insole stream now would truncate this take's pressure data. Stop the recording first.",
+            }
+        ), 409
     try:
         ble.stop_streaming()
         saved = ble.stop_logging() if ble.logging_active else None
@@ -4163,8 +4683,9 @@ def _get_heartbeat_files_info(rec_dir: Path) -> dict:
 @app.route("/download_file/<path:filepath>", methods=["GET"])
 def download_file(filepath):
     try:
-        file_path = BASE_DIR / filepath
-        if not str(file_path.resolve()).startswith(str(BASE_DIR.resolve())):
+        # Same fix as /media: prefix-sharing siblings defeat startswith.
+        file_path = (BASE_DIR / filepath).resolve()
+        if not file_path.is_relative_to(BASE_DIR.resolve()):
             return jsonify({"status": "error", "message": "Invalid file path"}), 403
         if not file_path.exists():
             return jsonify({"status": "error", "message": "File not found"}), 404
@@ -4174,9 +4695,15 @@ def download_file(filepath):
 
 
 if __name__ == "__main__":
-    print(f"Session directory: {SESSION_DIR}")
+    rig_log.info("Session directory: %s", SESSION_DIR)
+    try:
+        recovered_logs = recover_ble_wals(BASE_DIR / "sessions")
+        if recovered_logs:
+            ble_logger.warning("Recovered %d insole log(s) from crash WALs", recovered_logs)
+    except Exception as exc:
+        log_exception(ble_logger, f"WAL recovery scan failed: {exc}")
     heartbeat_start = heartbeat.start_sidecar()
-    print(f"Heartbeat sidecar: {heartbeat_start}")
+    rig_log.info("Heartbeat sidecar: %s", heartbeat_start)
     start_camera_bootstrap()
     start_capture_threads()
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
