@@ -1,5 +1,16 @@
 # Changelog
 
+## V14-pre — hardening port (2026-08-20, branch `feat/rig-v13-hardening`)
+
+Re-applied the R1–R24 review hardening (forgeon `fix/rig-v11-hardening` @ 8588a3b1)
+onto the V13 codebase — the hardened V12 hand-off was never deployed to the rig, so
+V13 descended from an unhardened lineage. Non-audio findings only; all mic/audio
+hardening is deferred as-is by decision (see docs/rig-hardening-checklist.md for the
+per-finding status, docs/rig-review.md for the original review). R12's inbound token
+gate is present but dormant (RIG_API_TOKEN unset = open). New docs/direct-upload-design.md
+covers the rig→cloud direct upload (R12 enablement, R15 worker, R20 identity, R23).
+No VERSION bump yet — that happens at rig deploy.
+
 ## V13 — recovered from the production rig (2026-08-19)
 
 The authoritative comparison baseline was
