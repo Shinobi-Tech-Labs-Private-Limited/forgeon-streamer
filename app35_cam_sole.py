@@ -1867,14 +1867,51 @@ def _calibration_status_payload() -> dict:
         originals = calibration_data.get("used_source_images") or calibration_data.get("source_images") or []
         undistorted = calibration_data.get("undistorted_images") or []
         if originals and undistorted:
-            original_path = originals[-1]
-            undistorted_path = undistorted[-1]
-            preview = {
-                "original_path": original_path,
-                "original_url": url_for("media_file", filepath=original_path),
-                "undistorted_path": undistorted_path,
-                "undistorted_url": url_for("media_file", filepath=undistorted_path),
-            }
+            original_path = Path(originals[-1])
+            undistorted_path = Path(undistorted[-1])
+            original_file = original_path if original_path.is_absolute() else BASE_DIR / original_path
+            undistorted_file = undistorted_path if undistorted_path.is_absolute() else BASE_DIR / undistorted_path
+            if original_file.is_file() and undistorted_file.is_file():
+                preview = {
+                    "original_path": _rel(original_file),
+                    "original_url": url_for("media_file", filepath=_rel(original_file)),
+                    "undistorted_path": _rel(undistorted_file),
+                    "undistorted_url": url_for("media_file", filepath=_rel(undistorted_file)),
+                }
+
+        # Uploaded calibrations often refer to source/preview images that only
+        # existed on the machine where calibration was performed.  Build a
+        # preview from the newest image in this session instead of returning
+        # broken media URLs for those stale paths.
+        if preview is None and snaps:
+            original_file = BASE_DIR / snaps[-1]["image_path"]
+            preview_dir = CALIBRATION_DIR / "undistorted_images"
+            undistorted_file = preview_dir / f"{original_file.parent.name}_{original_file.stem}_undistorted.jpg"
+            try:
+                frame = cv2.imread(str(original_file))
+                candidate, image_size = _candidate_from_calibration(calibration_data)
+                if frame is None:
+                    raise ValueError(f"Could not read preview image: {_rel(original_file)}")
+                actual_size = (frame.shape[1], frame.shape[0])
+                if actual_size != image_size:
+                    raise ValueError(
+                        f"Preview image is {actual_size[0]}x{actual_size[1]}, but calibration expects "
+                        f"{image_size[0]}x{image_size[1]}"
+                    )
+                if not undistorted_file.is_file():
+                    map1, map2 = make_maps(candidate, image_size)
+                    corrected = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
+                    preview_dir.mkdir(parents=True, exist_ok=True)
+                    if not cv2.imwrite(str(undistorted_file), corrected):
+                        raise ValueError(f"Could not write preview image: {_rel(undistorted_file)}")
+                preview = {
+                    "original_path": _rel(original_file),
+                    "original_url": url_for("media_file", filepath=_rel(original_file)),
+                    "undistorted_path": _rel(undistorted_file),
+                    "undistorted_url": url_for("media_file", filepath=_rel(undistorted_file)),
+                }
+            except (KeyError, TypeError, ValueError, cv2.error):
+                preview = None
     return {
         "status": "success",
         "session_dir": _rel(SESSION_DIR),

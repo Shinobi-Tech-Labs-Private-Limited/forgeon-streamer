@@ -442,7 +442,11 @@
 
       if (preview) {
         const p = st.preview || null;
-        if (p && p.original_url && p.undistorted_url) {
+        const previewKey = JSON.stringify(p || null);
+        if (preview.dataset.renderKey === previewKey) {
+          // Keep the existing image nodes alive; replacing them on every poll
+          // makes the browser reload both images and visibly flicker.
+        } else if (p && p.original_url && p.undistorted_url) {
           preview.className = '';
           preview.innerHTML = `
             <h3>Undistortion Preview</h3>
@@ -463,9 +467,13 @@
           preview.className = 'hint';
           preview.innerHTML = 'Run calibration to preview an undistorted result.';
         }
+        preview.dataset.renderKey = previewKey;
       }
 
       const snaps = st.snaps || [];
+      const carouselKey = JSON.stringify(snaps);
+      if (carousel.dataset.renderKey === carouselKey) return;
+      carousel.dataset.renderKey = carouselKey;
       if (!snaps.length) {
         carousel.innerHTML = 'No calibration images captured yet.';
         return;
