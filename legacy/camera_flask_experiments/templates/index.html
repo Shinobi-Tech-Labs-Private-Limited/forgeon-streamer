@@ -1,0 +1,113 @@
+<!doctype html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <title>{{ session_name }} - Live Streams</title>
+    <style>
+        body {
+            font-family: sans-serif;
+        }
+
+        .grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 16px;
+        }
+
+        .cam {
+            flex: 1 0 30%;
+            min-width: 320px;
+        }
+
+        .cam img {
+            width: 100%;
+            height: auto;
+            border: 2px solid #333;
+        }
+
+        .timer {
+            font-size: 1.2rem;
+            font-weight: bold;
+            margin-left: 1rem;
+            color: #d00;
+        }
+
+        .recordings a {
+            text-decoration: none;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>{{ session_name }} – Live Streams</h1>
+
+    <form action="{{ url_for('start_recording') }}" method="post" style="display:inline-block;">
+        <button type="submit" {{ 'disabled' if recording }}>Start Recording</button>
+    </form>
+    <form action="{{ url_for('stop_recording') }}" method="post" style="display:inline-block;">
+        <button type="submit" {{ '' if recording else 'disabled' }}>Stop Recording</button>
+    </form>
+    <form action="{{ url_for('capture_photos') }}" method="post" style="display:inline;">
+        <button type="submit">📸 Click Photo (all cams)</button>
+    </form>
+
+    <span id="timer" class="timer" style="display: {{ 'inline' if recording else 'none' }};">00:00</span>
+
+    <div class="grid" style="margin-top:20px;">
+        {% for cam in cameras %}
+        <div class="cam">
+            <h3>{{ cam }}</h3>
+            <img src="{{ url_for('video_feed', cam_key=cam) }}" />
+        </div>
+        {% endfor %}
+    </div>
+
+    <h2 style="margin-top:30px;">Recordings in this session</h2>
+    {% if recordings %}
+    <ol class="recordings">
+        {% for rec in recordings %}
+        <li><a href="{{ url_for('play', recording_name=rec) }}">{{ rec | replace('_', ' ') }}</a></li>
+        {% endfor %}
+    </ol>
+
+    <h3>Previous Recordings</h3>
+    <ul>
+        {% for session in sessions %}
+        <li>{{ session.name }}
+            <ul>
+                {% for rec in session.recordings %}
+                <li><a href="/play/{{ session.name }}/{{ rec }}">{{ rec }}</a></li>
+                {% endfor %}
+            </ul>
+        </li>
+        {% endfor %}
+    </ul>
+
+    {% else %}
+    <p>No recordings yet.</p>
+    {% endif %}
+
+
+
+    <script>
+        const isRecording = {{ 'true' if recording else 'false' }};
+        const startEpoch = {{ recording_start_epoch if recording_start_epoch is not none else 'null' }};
+        const timerEl = document.getElementById('timer');
+
+        function fmt(n) { return n < 10 ? '0' + n : n; }
+
+        if (isRecording && startEpoch) {
+            function tick() {
+                const elapsed = Math.floor(Date.now() / 1000 - startEpoch);
+                const mm = Math.floor(elapsed / 60);
+                const ss = elapsed % 60;
+                timerEl.textContent = `${fmt(mm)}:${fmt(ss)}`;
+            }
+            tick();
+            setInterval(tick, 1000);
+        }
+    </script>
+</body>
+
+</html>

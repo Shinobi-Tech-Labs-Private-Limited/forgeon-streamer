@@ -1,0 +1,160 @@
+<!-- camera_app/templates/index.html -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Multi-Camera Recorder</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #f6f6f6;
+            margin: 0;
+            padding: 20px;
+        }
+
+        h1,
+        h2 {
+            text-align: center;
+        }
+
+        .camera-container {
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-bottom: 20px;
+        }
+
+        .camera-frame {
+            border: 2px solid #ccc;
+            border-radius: 8px;
+            overflow: hidden;
+            width: 426px;
+            height: 320px;
+            background-color: #000;
+        }
+
+        video,
+        img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .controls {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+            border-radius: 5px;
+            border: none;
+        }
+
+        .start-btn {
+            background-color: #4CAF50;
+            color: white;
+        }
+
+        .stop-btn {
+            background-color: #f44336;
+            color: white;
+        }
+
+        .timer {
+            text-align: center;
+            font-size: 20px;
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 20px;
+        }
+
+        .sessions {
+            margin: 0 auto;
+            max-width: 900px;
+        }
+
+        .session {
+            margin-bottom: 20px;
+        }
+
+        .recordings {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .recording {
+            background-color: #fff;
+            padding: 10px;
+            border-radius: 5px;
+            border: 1px solid #ccc;
+        }
+
+        .recording a {
+            text-decoration: none;
+            color: #007bff;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Multi-Camera Recorder</h1>
+
+    <div class="camera-container">
+        {% for cam_id in camera_ids %}
+        <div class="camera-frame">
+            <img src="{{ url_for('video_feed', cam_id=cam_id) }}" alt="Camera {{ cam_id }}">
+        </div>
+        {% endfor %}
+    </div>
+
+    <div class="controls">
+        <form action="/start" method="post">
+            <button type="submit" class="start-btn">Start Recording</button>
+        </form>
+        <form action="/stop" method="post">
+            <button type="submit" class="stop-btn">Stop Recording</button>
+        </form>
+    </div>
+
+    {% if recording %}
+    <div class="timer" id="recordingTimer">Recording... 0s</div>
+    <script>
+        let seconds = {{ elapsed_time }};
+        const timerElem = document.getElementById("recordingTimer");
+
+        setInterval(() => {
+            seconds += 1;
+            timerElem.textContent = `Recording... ${seconds}s`;
+        }, 1000);
+    </script>
+    {% endif %}
+
+    <div class="sessions">
+        <h2>Recorded Sessions</h2>
+        {% for session, files in sessions %}
+        <div class="session">
+            <h3>{{ session }}</h3>
+            <div class="recordings">
+                {% for file in files %}
+                <div class="recording">
+                    <p>{{ file }}</p>
+                    <a href="{{ url_for('play_video', session=session, filename=file) }}" target="_blank">Play</a> |
+                    <a href="{{ url_for('download_video', session=session, filename=file) }}">Download</a>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+</body>
+
+</html>

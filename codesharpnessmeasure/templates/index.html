@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rig focus — cube</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: #111; color: #eee; }
+  header { padding: 14px 18px; border-bottom: 1px solid #333; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .02em; }
+  header .hint { color: #999; font-size: 13px; }
+  .controls { margin-left: auto; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  button, select { font: inherit; padding: 8px 12px; background: #222; color: #eee; border: 1px solid #444; border-radius: 4px; cursor: pointer; }
+  button.primary { background: #eee; color: #111; border-color: #eee; font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  label.toggle { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; color: #ccc; }
+  main { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; padding: 16px; }
+  .card { background: #1a1a1a; border: 1px solid #333; border-radius: 6px; padding: 16px 18px; }
+  .card h3 { margin: 0 0 8px; font-size: 14px; font-weight: 600; color: #bbb; text-transform: uppercase; letter-spacing: .06em; display: flex; justify-content: space-between; align-items: center; }
+  .badge { display: inline-block; padding: 4px 10px; border-radius: 4px; font-size: 13px; font-weight: 700; color: #fff; background: #555; min-width: 64px; text-align: center; }
+  .score { font-size: 72px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1; margin: 6px 0 2px; }
+  .score small { font-size: 16px; color: #888; font-weight: 400; margin-left: 8px; }
+  .bar { height: 8px; background: #2a2a2a; border-radius: 4px; overflow: hidden; margin: 10px 0; }
+  .bar > div { height: 100%; width: 0; background: #2e7d32; transition: width .2s, background .2s; }
+  .meta { color: #999; font-size: 13px; display: flex; gap: 14px; flex-wrap: wrap; }
+  .meta b { color: #ddd; font-weight: 600; }
+  .row { display: flex; gap: 8px; margin-top: 12px; }
+  .row button { flex: 1; }
+  .err { color: #e57373; font-size: 13px; }
+  footer { padding: 10px 18px 18px; color: #777; font-size: 12px; line-height: 1.5; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Rig focus · ChArUco cube</h1>
+  <span class="hint">Put the cube 2–3 m in front of the lens. Turn the ring until the score peaks, overshoot, come back to <b>PEAK</b>.</span>
+  <div class="controls">
+    <label class="toggle"><input type="checkbox" id="auto" checked> auto-refresh</label>
+    <label class="toggle">speak
+      <select id="speakCam"><option value="">off</option><option value="cam1">cam1</option><option value="cam2">cam2</option><option value="cam3">cam3</option></select>
+    </label>
+    <button id="checkAll" class="primary" onclick="checkAll()">Check now</button>
+    <button onclick="resetBest()">Reset best (all)</button>
+  </div>
+</header>
+
+<main id="cards"></main>
+
+<footer>
+  Score = Laplacian variance of the cube region, normalised for square size and contrast (relative — no absolute "sharp").
+  <b>Best</b> is the highest score seen for that camera since start / reset; PEAK ≥ 97 % of best, NEAR ≥ 85 %, LOW below.
+  Reset the best after you move the cube or re-aim the camera. NO CUBE = no marker detected (move the cube into view, or the lens is very far out of focus).
+</footer>
+
+<script>
+const CAMS = ['cam1', 'cam2', 'cam3'];
+const $ = (id) => document.getElementById(id);
+const last = {};
+
+function card(cam) {
+  return `
+  <div class="card" id="card-${cam}">
+    <h3><span>${cam}</span><span class="badge" id="${cam}-badge">—</span></h3>
+    <div class="score"><span id="${cam}-score">—</span><small>best <span id="${cam}-best">—</span></small></div>
+    <div class="bar"><div id="${cam}-bar"></div></div>
+    <div class="meta">
+      <span>corners <b id="${cam}-corners">—</b></span>
+      <span>markers <b id="${cam}-markers">—</b></span>
+      <span>faces <b id="${cam}-faces">—</b></span>
+      <span>sq px <b id="${cam}-sq">—</b></span>
+    </div>
+    <div class="err" id="${cam}-err"></div>
+    <div class="row">
+      <button onclick="checkFocus('${cam}')">Check ${cam}</button>
+      <button onclick="resetBest('${cam}')">Reset best</button>
+    </div>
+  </div>`;
+}
+$('cards').innerHTML = CAMS.map(card).join('');
+
+function fmt(v, d = 3) { return (v === null || v === undefined) ? '—' : Number(v).toFixed(d); }
+
+function render(cam, data) {
+  const badge = $(`${cam}-badge`);
+  $(`${cam}-err`).innerText = data.error ? data.error : '';
+  if (!data.detected) {
+    badge.innerText = data.label || 'NO CUBE';
+    badge.style.background = '#666';
+    $(`${cam}-score`).innerText = '—';
+    $(`${cam}-best`).innerText = fmt(data.best);
+    $(`${cam}-bar`).style.width = '0%';
+    $(`${cam}-corners`).innerText = data.corners ?? '—';
+    $(`${cam}-markers`).innerText = data.markers ?? '—';
+    $(`${cam}-faces`).innerText = '—';
+    $(`${cam}-sq`).innerText = '—';
+    return;
+  }
+  badge.innerText = data.label;
+  badge.style.background = data.color;
+  $(`${cam}-score`).innerText = fmt(data.score);
+  $(`${cam}-best`).innerText = fmt(data.best);
+  const ratio = data.ratio_to_best ?? (data.best ? data.score / data.best : 0);
+  const bar = $(`${cam}-bar`);
+  bar.style.width = `${Math.max(0, Math.min(100, ratio * 100))}%`;
+  bar.style.background = data.color;
+  $(`${cam}-corners`).innerText = data.corners;
+  $(`${cam}-markers`).innerText = data.markers;
+  $(`${cam}-faces`).innerText = (data.faces && data.faces.length) ? data.faces.join(' ') : '—';
+  $(`${cam}-sq`).innerText = data.square_px ?? '—';
+  speak(cam, data);
+}
+
+let lastSpokenAt = 0;
+function speak(cam, data) {
+  if ($('speakCam').value !== cam || !('speechSynthesis' in window)) return;
+  const now = Date.now();
+  if (now - lastSpokenAt < 1500) return;
+  lastSpokenAt = now;
+  window.speechSynthesis.cancel();
+  const txt = data.detected
+    ? `${Math.round((data.ratio_to_best ?? 0) * 100)} percent${data.label === 'PEAK' ? ', peak' : ''}`
+    : 'no cube';
+  window.speechSynthesis.speak(new SpeechSynthesisUtterance(txt));
+}
+
+async function checkFocus(cam) {
+  try {
+    const res = await fetch(`/focus/${cam}`);
+    render(cam, await res.json());
+  } catch (e) { $(`${cam}-err`).innerText = String(e); }
+}
+
+async function checkAll() {
+  try {
+    const res = await fetch('/focus/all');
+    const data = await res.json();
+    for (const [cam, result] of Object.entries(data)) if ($(`card-${cam}`)) render(cam, result);
+  } catch (e) { CAMS.forEach(c => $(`${c}-err`).innerText = String(e)); }
+}
+
+async function resetBest(cam) {
+  await fetch('/focus/reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cam ? { camera: cam } : {}) });
+  (cam ? [cam] : CAMS).forEach(c => { $(`${c}-best`).innerText = '—'; $(`${c}-bar`).style.width = '0%'; });
+}
+
+let timer = null;
+function loop() {
+  if (!$('auto').checked) return;
+  checkAll().finally(() => { timer = setTimeout(loop, 700); });
+}
+$('auto').addEventListener('change', () => { if ($('auto').checked) loop(); else clearTimeout(timer); });
+loop();
+</script>
+</body>
+</html>
