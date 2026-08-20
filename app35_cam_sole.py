@@ -3847,6 +3847,8 @@ def stop_combined():
 # ==================== Routes (UI) ====================
 @app.route("/")
 def index():
+    if not rig_paired():
+        return redirect("/pair")
     if not sport_selected():
         return render_template("index35_cam_sole.html", **ui_template_context("sport_select"))
     return redirect(url_for("recording_page" if (not calibration_required() or calibration_available()) else "calibration_page"))
@@ -3880,6 +3882,8 @@ def calibration_page():
 
 @app.route("/recording")
 def recording_page():
+    if not rig_paired():
+        return redirect("/pair")
     if not sport_selected():
         return redirect(url_for("index"))
     if calibration_required() and not calibration_available():
@@ -3997,6 +4001,8 @@ def lens_status_route():
 
 @app.route("/start_recording", methods=["POST"])
 def start_recording_route():
+    if not rig_paired():
+        return "This rig is not paired with Forgeon yet - open /pair first.", 403
     try:
         with session_state_lock:
             start_combined(capture_ble=True)
@@ -4155,6 +4161,11 @@ def api_calibration_upload_json():
 # ==================== Routes (API Camera+Combined) ====================
 @app.route("/api/start_recording", methods=["POST"])
 def api_start_recording():
+    if not rig_paired():
+        return jsonify({
+            "status": "not_paired",
+            "message": "This rig is not paired with Forgeon. Open localhost:5000/pair on the rig and enter a code from the admin Rig devices page.",
+        }), 403
     try:
         with session_state_lock:
             if is_recording_evt.is_set():
@@ -4720,6 +4731,14 @@ def _get_heartbeat_files_info(rec_dir: Path) -> dict:
     return heartbeat.files_info(rec_dir)
 
 
+def rig_paired() -> bool:
+    """Pairing gate: the rig may only record once it holds cloud credentials
+    (env override or rig_device.json). Recording without pairing produces
+    takes that can neither auto-upload nor be traced to a device - /pair is
+    therefore the landing page until pairing is done."""
+    return upload_worker is not None
+
+
 @app.route("/api/pairing/status", methods=["GET"])
 def api_pairing_status():
     return jsonify({
@@ -4794,7 +4813,7 @@ def pairing_page():
 <p id=msg style="color:#b00"></p></div>
 <script>
 async function refresh(){const r=await fetch('/api/pairing/status');const d=await r.json();
- if(d.paired){document.getElementById('state').textContent='Paired as “'+(d.name||'this rig')+'” → '+d.api_url+' ('+d.source+')';document.getElementById('form').style.display='none';}
+ if(d.paired){document.getElementById('state').innerHTML='Paired as “'+(d.name||'this rig')+'” → '+d.api_url+' ('+d.source+') &nbsp; <a href="/">Go to recording</a>';document.getElementById('form').style.display='none';}
  else{document.getElementById('state').textContent='Not paired yet.';document.getElementById('form').style.display='block';}}
 async function claim(){const c=document.getElementById('code').value;const r=await fetch('/api/pairing/claim',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:c})});
  const d=await r.json();if(r.ok){document.getElementById('msg').textContent='';refresh();}else{document.getElementById('msg').textContent=d.message||'Pairing failed';}}
