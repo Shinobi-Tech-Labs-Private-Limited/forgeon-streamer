@@ -1,0 +1,644 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>{{ session_name }} - Cam + BLE</title>
+  <style>
+    body { font-family: sans-serif; margin: 16px; }
+    h1, h2, h3 { margin: 8px 0; }
+    .controls { margin-bottom: 14px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .timer { font-size: 1.1rem; font-weight: bold; color: #b00020; margin-left: 10px; }
+
+    .grid { display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 20px; }
+    .cam { flex: 1 0 30%; min-width: 320px; }
+    .status-panel { border: 1px solid #cfd7df; border-radius: 10px; background: #f8fbfd; padding: 10px 12px; margin-bottom: 10px; }
+    .status-title { font-weight: 700; margin-bottom: 8px; }
+    .status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; font-size: 0.92rem; }
+    .status-line { margin: 0; }
+    .status-label { color: #4e5d6c; font-weight: 600; }
+    .status-yes { color: #0a7d2e; font-weight: 700; }
+    .status-no { color: #b00020; font-weight: 700; }
+    .status-text { grid-column: 1 / -1; border-top: 1px solid #dde6ee; padding-top: 6px; }
+    .cam img { width: 100%; height: auto; border: 2px solid #333; }
+    .focus-panel { border: 1px solid #ccd8e0; border-radius: 8px; background: #fff; padding: 10px 12px; margin-bottom: 10px; }
+    .focus-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .focus-badge { display: inline-block; min-width: 86px; padding: 6px 8px; border-radius: 4px; color: #fff; background: #888; text-align: center; font-weight: 700; }
+    .focus-meta { margin: 6px 0 0; color: #4e5d6c; font-size: 0.92rem; }
+
+    .ble-section { border-top: 2px solid #ddd; padding-top: 14px; }
+    .led-section { border-top: 2px solid #ddd; padding-top: 14px; margin-bottom: 14px; }
+    .step-grid { display: grid; grid-template-columns: repeat(3, minmax(260px, 1fr)); gap: 12px; margin-bottom: 12px; }
+    .card { border: 1px solid #ccc; border-radius: 8px; padding: 12px; background: #fafafa; }
+    .step-title { font-weight: 700; margin-bottom: 6px; }
+    .hint { color: #555; font-size: 0.9rem; }
+    .mono { font-family: monospace; font-size: 0.9rem; }
+    .good { color: #0a7d2e; }
+    .warn { color: #b36b00; }
+
+    .list { max-height: 280px; overflow: auto; }
+    .device { border: 1px solid #ddd; border-radius: 6px; padding: 8px; margin-bottom: 8px; background: #fff; }
+    button, select { margin: 3px 2px; }
+
+    .monitor-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .panel-title { display: flex; justify-content: space-between; align-items: center; }
+    .kv { margin: 4px 0; }
+
+    .ch-row { display: grid; grid-template-columns: 40px 1fr 52px; gap: 8px; align-items: center; margin-bottom: 4px; }
+    .bar-wrap { width: 100%; height: 14px; border-radius: 10px; background: #ececec; overflow: hidden; }
+    .bar { height: 100%; width: 0%; transition: width 0.22s linear, background-color 0.22s linear; }
+
+    @media (max-width: 980px) {
+      .step-grid { grid-template-columns: 1fr; }
+      .monitor-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <h1>{{ session_name }} - Live Streams + BLE Insoles</h1>
+
+  <div class="controls">
+    <form action="{{ url_for('start_recording_route') }}" method="post" style="display:inline-block;">
+      <button type="submit" {{ 'disabled' if recording }}>Start Recording + BLE</button>
+    </form>
+    <form action="{{ url_for('stop_recording_route') }}" method="post" style="display:inline-block;">
+      <button type="submit" {{ '' if recording else 'disabled' }}>Stop Recording + BLE</button>
+    </form>
+    <form action="{{ url_for('capture_photos_route') }}" method="post" style="display:inline-block;">
+      <button type="submit">Capture Photos</button>
+    </form>
+    <span id="timer" class="timer" style="display: {{ 'inline' if recording else 'none' }};">00:00</span>
+  </div>
+
+  <div class="grid">
+    {% for cam in cameras %}
+    <div class="cam">
+      <h3>{{ cam }}</h3>
+      <div class="status-panel" id="status-{{ cam }}">
+        <div class="status-title">System Status</div>
+        <div class="hint">Loading camera health...</div>
+      </div>
+      <div class="focus-panel" id="focus-{{ cam }}">
+        <div class="focus-row">
+          <span class="focus-badge" id="{{ cam }}-focus-badge">--</span>
+        </div>
+        <div class="focus-meta">
+          Score: <span id="{{ cam }}-focus-score">--</span> |
+          Corners: <span id="{{ cam }}-focus-corners">--</span>
+        </div>
+      </div>
+      <img src="{{ url_for('video_feed', cam_key=cam) }}" />
+    </div>
+    {% endfor %}
+  </div>
+
+  <div class="led-section">
+    <h2>LED Sync Module</h2>
+    <div class="hint">Connect the Bluetooth serial port here. The recording buttons send <span class="mono">START</span> and <span class="mono">STOP</span> automatically.</div>
+
+    <div class="step-grid">
+      <div class="card">
+        <div class="step-title">Serial Port</div>
+        <button id="btnLedPorts">Scan LED Ports</button>
+        <select id="ledPortSelect">
+          <option value="">Auto/default</option>
+        </select>
+        <input id="ledPortManual" placeholder="Manual port, e.g. COM14" />
+        <div class="hint" id="ledPortSummary">No port scan yet.</div>
+      </div>
+
+      <div class="card">
+        <div class="step-title">Connection</div>
+        <button id="btnLedConnect">Connect LED</button>
+        <button id="btnLedDisconnect">Disconnect LED</button>
+        <div class="hint" id="ledState">Loading...</div>
+      </div>
+
+      <div class="card">
+        <div class="step-title">Command Test</div>
+        <button id="btnLedStart">Send START</button>
+        <button id="btnLedStop">Send STOP</button>
+        <div class="hint" id="ledCommandHint">Use these to verify the LED module before recording.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="ble-section">
+    <h2>BLE Workflow</h2>
+    <div class="hint">Order: 1) Scan, 2) Add devices to Pool, 3) Connect All, 4) Assign Left/Right + Blink + Frequency, 5) Start Recording + BLE.</div>
+
+    <div class="step-grid">
+      <div class="card">
+        <div class="step-title">Step 1: Scan</div>
+        <button id="btnScan">Scan BLE Devices</button>
+        <div class="hint" id="scanSummary">No scan yet.</div>
+      </div>
+
+      <div class="card">
+        <div class="step-title">Step 2: Pool and Connect</div>
+        <button id="btnConnectAll">Connect All in Pool</button>
+        <button id="btnDisconnectAll">Disconnect All</button>
+        <div class="hint" id="connectSummary">Pool: 0 | Connected: 0</div>
+      </div>
+
+      <div class="card">
+        <div class="step-title">Step 3: Stream Settings</div>
+        <button id="btnBleStart">Start BLE Streaming</button>
+        <button id="btnBleStop">Stop BLE Streaming</button>
+        <div class="hint" id="bleStreamHint">BLE stream: Unknown</div>
+        <hr/>
+        <label for="freqSel">Frequency:</label>
+        <select id="freqSel">
+          <option>10Hz</option>
+          <option>100Hz</option>
+          <option selected>200Hz</option>
+        </select>
+        <button id="btnFreq">Apply Frequency</button>
+        <div class="hint">BLE logs are saved to <span class="mono">recording_X/ble/</span> in this session.</div>
+      </div>
+    </div>
+
+    <div class="step-grid">
+      <div class="card">
+        <h3>Discovered Devices</h3>
+        <div id="scanList" class="list hint">No devices.</div>
+      </div>
+
+      <div class="card">
+        <h3>Pool and Assignment</h3>
+        <div id="poolList" class="list hint">No devices in pool.</div>
+      </div>
+
+      <div class="card">
+        <h3>BLE State</h3>
+        <div id="bleState" class="hint">Loading...</div>
+      </div>
+    </div>
+
+    <h3>Live Insole Monitor</h3>
+    <div class="monitor-grid">
+      <div class="card" id="panelLeft"></div>
+      <div class="card" id="panelRight"></div>
+    </div>
+  </div>
+
+  <script>
+    const isRecording = {{ 'true' if recording else 'false' }};
+    const startEpoch = {{ recording_start_epoch if recording_start_epoch is not none else 'null' }};
+    const timerEl = document.getElementById('timer');
+
+    function fmt(n) { return n < 10 ? '0' + n : n; }
+    if (isRecording && startEpoch) {
+      function tick() {
+        const elapsed = Math.floor(Date.now() / 1000 - startEpoch);
+        const mm = Math.floor(elapsed / 60);
+        const ss = elapsed % 60;
+        timerEl.textContent = `${fmt(mm)}:${fmt(ss)}`;
+      }
+      tick();
+      setInterval(tick, 1000);
+    }
+
+    function esc(s) {
+      return String(s || '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+    const pendingSideByAddress = {};
+    let pausePoolRenderUntil = 0;
+
+    function pausePoolRender(ms = 2200) {
+      pausePoolRenderUntil = Date.now() + ms;
+    }
+
+    function isPoolRenderPaused() {
+      return Date.now() < pausePoolRenderUntil;
+    }
+
+    async function api(path, method = 'GET', body = null) {
+      const opts = { method, headers: { 'Content-Type': 'application/json' } };
+      if (body) opts.body = JSON.stringify(body);
+      const res = await fetch(path, opts);
+      const data = await res.json();
+      if (!res.ok || data.status === 'error') {
+        throw new Error(data.message || `Request failed: ${path}`);
+      }
+      return data;
+    }
+
+    function renderLedStatus(st) {
+      const el = document.getElementById('ledState');
+      if (!el) return;
+      const status = st.connected ? '<span class="good">Connected</span>' : '<span class="warn">Disconnected</span>';
+      const serial = st.serial_available ? '<span class="good">Available</span>' : '<span class="warn">Missing</span>';
+      el.innerHTML = `
+        Status: ${status}<br/>
+        Serial: ${serial}<br/>
+        Port: <span class="mono">${esc(st.address || '--')}</span><br/>
+        Baud: <span class="mono">${Number(st.baud || 0)}</span><br/>
+        Last Command: <span class="mono">${esc(st.last_command || '--')}</span><br/>
+        Last RX: <span class="mono">${esc(st.last_rx || '--')}</span><br/>
+        Last Message: ${esc(st.last_message || '--')}<br/>
+        Last Error: ${esc(st.last_error || 'None')}
+      `;
+      document.getElementById('btnLedConnect').disabled = !!st.connected || !st.serial_available || !st.enabled;
+      document.getElementById('btnLedDisconnect').disabled = !st.connected;
+      document.getElementById('btnLedStart').disabled = !st.connected;
+      document.getElementById('btnLedStop').disabled = !st.connected;
+    }
+
+    async function refreshLedStatus() {
+      try {
+        const st = await api('/api/led/status');
+        renderLedStatus(st);
+      } catch (err) {
+        const el = document.getElementById('ledState');
+        if (el) el.innerHTML = `<span class="warn">${esc(err.message)}</span>`;
+      }
+    }
+
+    async function scanLedPorts() {
+      try {
+        const out = await api('/api/led/ports');
+        const ports = out.ports || [];
+        const sel = document.getElementById('ledPortSelect');
+        sel.innerHTML = '<option value="">Auto/default</option>' + ports.map((p) => {
+          const label = `${p.address || '--'} - ${p.name || 'Unknown'}`;
+          return `<option value="${esc(p.address || '')}">${esc(label)}</option>`;
+        }).join('');
+        document.getElementById('ledPortSummary').textContent = ports.length ? `Found ${ports.length} serial port(s).` : 'No serial ports found.';
+        renderLedStatus(out);
+      } catch (err) {
+        alert(err.message);
+        await refreshLedStatus();
+      }
+    }
+
+    function selectedLedPort() {
+      const manual = document.getElementById('ledPortManual').value.trim();
+      if (manual) return manual;
+      return document.getElementById('ledPortSelect').value.trim();
+    }
+
+    async function connectLed() {
+      try {
+        await api('/api/led/connect', 'POST', { address: selectedLedPort() });
+        await refreshLedStatus();
+      } catch (err) {
+        alert(err.message);
+        await refreshLedStatus();
+      }
+    }
+
+    async function disconnectLed() {
+      try {
+        await api('/api/led/disconnect', 'POST');
+        await refreshLedStatus();
+      } catch (err) {
+        alert(err.message);
+      }
+    }
+
+    async function sendLedCommand(command) {
+      try {
+        const out = await api('/api/led/send', 'POST', { command });
+        document.getElementById('ledCommandHint').textContent = out.message || `Sent ${command}`;
+        await refreshLedStatus();
+      } catch (err) {
+        alert(err.message);
+        await refreshLedStatus();
+      }
+    }
+
+    function deviceCard(dev) {
+      const s = dev.connected ? '<span class="good">Connected</span>' : '<span class="warn">Disconnected</span>';
+      const selectedSide = pendingSideByAddress[dev.address] || dev.side || '';
+      const side = selectedSide || 'Unassigned';
+      const addrArg = String(dev.address || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+      return `
+        <div class="device">
+          <div><b>${esc(dev.name)}</b></div>
+          <div class="mono">${esc(dev.address)}</div>
+          <div>Status: ${s}</div>
+          <div>Side: ${esc(side)}</div>
+          <div>Packets: <span class="mono">${Number(dev.packet_count || 0)}</span></div>
+          <div class="hint">Raw notify: <span class="mono">${Number(dev.raw_notify_count || 0)}</span> | Bad: <span class="mono">${Number(dev.bad_packet_count || 0)}</span> | Last size: <span class="mono">${Number(dev.last_packet_size || 0)}</span></div>
+          <div>
+            <select onmousedown="pausePoolRender(3000)" onfocus="pausePoolRender(3000)" onchange="setPendingSide('${addrArg}', this.value)">
+              <option value="">Select side</option>
+              <option value="Left" ${selectedSide === 'Left' ? 'selected' : ''}>Left</option>
+              <option value="Right" ${selectedSide === 'Right' ? 'selected' : ''}>Right</option>
+            </select>
+            <button onclick="assignSide('${addrArg}')">Assign</button>
+          </div>
+          <div>
+            <button onclick="toggleLed('${addrArg}')" ${dev.connected ? '' : 'disabled'} title="${dev.connected ? 'Blink to identify device' : 'Connect device first'}">Blink LED</button>
+            <button onclick="removeDev('${addrArg}')">Remove</button>
+          </div>
+          <div class="hint">Model: ${esc(dev.device_info?.model_number || '--')}</div>
+        </div>`;
+    }
+
+    function scanCard(dev) {
+      const safeName = esc(dev.name || 'Unknown');
+      const safeAddr = esc(dev.address || '');
+      return `
+        <div class="device">
+          <div><b>${safeName}</b></div>
+          <div class="mono">${safeAddr}</div>
+          <div>RSSI: ${dev.rssi ?? '--'}</div>
+          <button onclick="addDev('${safeAddr}', '${safeName}')">Add to Pool</button>
+        </div>`;
+    }
+
+    function channelColor(rawVal) {
+      const v = Math.max(0, Math.min(4095, Number(rawVal || 0)));
+      const disp = 4095 - v;
+      let r, g, b;
+      if (disp < 2048) {
+        r = 0;
+        g = Math.round((disp / 2048) * 255);
+        b = Math.round(((2048 - disp) / 2048) * 255);
+      } else {
+        r = Math.round(((disp - 2048) / 2047) * 255);
+        g = Math.round(((4095 - disp) / 2047) * 255);
+        b = 0;
+      }
+      return `rgb(${r}, ${g}, ${b})`;
+    }
+
+    function monitorPanel(title, dev) {
+      if (!dev) {
+        return `<div class="panel-title"><b>${title}</b><span class="warn">Not assigned</span></div>`;
+      }
+
+      const ch = Array.isArray(dev.channels) ? dev.channels : [];
+      const rows = Array.from({ length: 8 }).map((_, i) => {
+        const val = Number(ch[i] || 0);
+        const disp = 4095 - Math.max(0, Math.min(4095, val));
+        const pct = Math.max(0, Math.min(100, (disp / 4095) * 100));
+        return `
+          <div class="ch-row">
+            <div class="mono">Ch${i}</div>
+            <div class="bar-wrap"><div class="bar" style="width:${pct}%; background:${channelColor(val)}"></div></div>
+            <div class="mono">${val}</div>
+          </div>`;
+      }).join('');
+
+      return `
+        <div class="panel-title"><b>${title}: ${esc(dev.name || 'Device')}</b><span class="${dev.connected ? 'good':'warn'}">${dev.connected ? 'Connected' : 'Disconnected'}</span></div>
+        <div class="kv">Address: <span class="mono">${esc(dev.address)}</span></div>
+        <div class="kv">Battery: ${dev.battery_voltage || '--'} mV | Charging: ${dev.is_charging ? 'Yes' : 'No'} | Freq: 0x${Number(dev.frequency_code || 0).toString(16).padStart(2, '0')}</div>
+        <div class="kv">Packet Count: ${Number(dev.packet_count || 0)}</div>
+        <hr/>
+        ${rows}
+      `;
+    }
+
+    function yesNo(flag) {
+      return `<span class="${flag ? 'status-yes' : 'status-no'}">${flag ? 'Yes' : 'No'}</span>`;
+    }
+
+    function renderCameraStatus(camKey, data) {
+      const el = document.getElementById(`status-${camKey}`);
+      if (!el) return;
+      if (!data) {
+        el.innerHTML = `<div class="status-title">System Status</div><div class="hint">No status available.</div>`;
+        return;
+      }
+      el.innerHTML = `
+        <div class="status-title">System Status</div>
+        <div class="status-grid">
+          <div class="status-line"><span class="status-label">SSH:</span> ${yesNo(data.ssh_ok)}</div>
+          <div class="status-line"><span class="status-label">Camera Connected:</span> ${yesNo(data.camera_connected)}</div>
+          <div class="status-line"><span class="status-label">RTSP Server Running:</span> ${yesNo(data.rtsp_server_running)}</div>
+          <div class="status-line"><span class="status-label">Preview Healthy:</span> ${yesNo(data.preview_healthy)}</div>
+          <div class="status-line status-text"><span class="status-label">Last Error:</span> ${esc(data.last_error || 'None')}</div>
+          <div class="status-line status-text"><span class="status-label">Last Log Line:</span> ${esc(data.last_log_line || 'No logs yet')}</div>
+        </div>
+      `;
+    }
+
+    function renderFocus(camKey, result) {
+      const badge = document.getElementById(`${camKey}-focus-badge`);
+      const score = document.getElementById(`${camKey}-focus-score`);
+      const corners = document.getElementById(`${camKey}-focus-corners`);
+      if (!badge || !score || !corners) return;
+
+      if (result.error) {
+        badge.textContent = result.label || 'ERROR';
+        badge.style.background = result.color || '#888888';
+        score.textContent = '--';
+        corners.textContent = result.error;
+        return;
+      }
+
+      badge.textContent = result.label || 'NO BOARD';
+      badge.style.background = result.color || '#888888';
+      score.textContent = result.score ?? '--';
+      corners.textContent = result.corners ?? '--';
+    }
+
+    async function checkAllFocus() {
+      try {
+        const res = await fetch('/focus/all');
+        const data = await res.json();
+        Object.entries(data).forEach(([camKey, result]) => renderFocus(camKey, result));
+      } catch (err) {
+        {{ cameras|tojson }}.forEach((camKey) => {
+          renderFocus(camKey, { label: 'ERROR', color: '#888888', error: err.message });
+        });
+      }
+    }
+
+    async function refreshCameraStatus() {
+      try {
+        const st = await api('/api/camera/status');
+        const cams = st.cameras || {};
+        Object.keys(cams).forEach((camKey) => renderCameraStatus(camKey, cams[camKey]));
+      } catch (err) {
+        {{ cameras|tojson }}.forEach((camKey) => {
+          const el = document.getElementById(`status-${camKey}`);
+          if (el) {
+            el.innerHTML = `<div class="status-title">System Status</div><div class="warn">${esc(err.message)}</div>`;
+          }
+        });
+      }
+    }
+
+    async function refreshBleStatus() {
+      try {
+        const st = await api('/api/ble/status');
+        const scanList = document.getElementById('scanList');
+        const poolList = document.getElementById('poolList');
+        const bleState = document.getElementById('bleState');
+
+        document.getElementById('scanSummary').textContent = `Discovered: ${st.discovered?.length || 0}`;
+        document.getElementById('connectSummary').textContent = `Pool: ${st.pool_count || 0} | Connected: ${st.connected_count || 0}`;
+        document.getElementById('bleStreamHint').innerHTML = `BLE stream: <b>${st.streaming ? 'ON' : 'OFF'}</b>`;
+        document.getElementById('btnBleStart').disabled = !!st.streaming;
+        document.getElementById('btnBleStop').disabled = !st.streaming;
+
+        if (st.discovered && st.discovered.length) {
+          scanList.innerHTML = st.discovered.map(scanCard).join('');
+        } else {
+          scanList.innerHTML = '<span class="hint">No devices.</span>';
+        }
+
+        if (!isPoolRenderPaused()) {
+          if (st.devices && st.devices.length) {
+            poolList.innerHTML = st.devices.map(deviceCard).join('');
+          } else {
+            poolList.innerHTML = '<span class="hint">No devices in pool.</span>';
+          }
+        }
+
+        bleState.innerHTML = `
+          Streaming: <b>${st.streaming ? 'Yes' : 'No'}</b><br/>
+          Streaming Devices: <b>${Number(st.streaming_devices || 0)}</b><br/>
+          Total Packets: <b>${Number(st.total_packets || 0)}</b><br/>
+          Logging: <b>${st.logging_active ? 'Yes' : 'No'}</b><br/>
+          Left: <span class="mono">${esc(st.left_address || '--')}</span><br/>
+          Right: <span class="mono">${esc(st.right_address || '--')}</span><br/>
+          Session: <span class="mono">${esc(st.session_dir || '--')}</span>
+        `;
+
+        const byAddr = {};
+        for (const d of (st.devices || [])) byAddr[d.address] = d;
+        const left = st.left_address ? byAddr[st.left_address] : null;
+        const right = st.right_address ? byAddr[st.right_address] : null;
+
+        document.getElementById('panelLeft').innerHTML = monitorPanel('LEFT INSOLE', left);
+        document.getElementById('panelRight').innerHTML = monitorPanel('RIGHT INSOLE', right);
+      } catch (err) {
+        document.getElementById('bleState').innerHTML = `<span class="warn">${esc(err.message)}</span>`;
+      }
+    }
+
+    async function doScan() {
+      try {
+        await api('/api/ble/scan', 'POST');
+        await refreshBleStatus();
+      } catch (err) {
+        alert(err.message);
+      }
+    }
+
+    async function addDev(address, name) {
+      try {
+        await api('/api/ble/add_device', 'POST', { address, name });
+        await refreshBleStatus();
+      } catch (err) {
+        alert(err.message);
+      }
+    }
+
+    async function removeDev(address) {
+      try {
+        await api('/api/ble/remove_device', 'POST', { address });
+        await refreshBleStatus();
+      } catch (err) {
+        alert(err.message);
+      }
+    }
+
+    function setPendingSide(address, side) {
+      pausePoolRender(2500);
+      pendingSideByAddress[address] = side;
+    }
+
+    async function assignSide(address) {
+      const side = pendingSideByAddress[address];
+      if (!side) {
+        alert('Select Left or Right first.');
+        return;
+      }
+      try {
+        await api('/api/ble/assign_side', 'POST', { address, side });
+        await refreshBleStatus();
+      } catch (err) {
+        alert(err.message);
+      }
+    }
+
+    async function toggleLed(address) {
+      try {
+        await api('/api/ble/toggle_led', 'POST', { address });
+      } catch (err) {
+        alert(err.message);
+      }
+    }
+
+    document.getElementById('btnScan').addEventListener('click', doScan);
+    document.getElementById('btnLedPorts').addEventListener('click', scanLedPorts);
+    document.getElementById('btnLedConnect').addEventListener('click', connectLed);
+    document.getElementById('btnLedDisconnect').addEventListener('click', disconnectLed);
+    document.getElementById('btnLedStart').addEventListener('click', () => sendLedCommand('START'));
+    document.getElementById('btnLedStop').addEventListener('click', () => sendLedCommand('STOP'));
+    document.getElementById('poolList').addEventListener('mouseenter', () => pausePoolRender(2000));
+    document.getElementById('poolList').addEventListener('mousemove', () => pausePoolRender(2000));
+
+    document.getElementById('btnConnectAll').addEventListener('click', async () => {
+      try {
+        const out = await api('/api/ble/connect_all', 'POST');
+        const lines = (out.results || []).map(r => `${r.name || 'Unknown'} (${r.address}): ${r.ok ? 'Connected' : `Failed${r.error ? ' - ' + r.error : ''}`}`);
+        alert(lines.length ? lines.join('\n') : 'No devices in pool.');
+        await refreshBleStatus();
+      } catch (err) {
+        alert(err.message);
+      }
+    });
+
+    document.getElementById('btnDisconnectAll').addEventListener('click', async () => {
+      try {
+        await api('/api/ble/disconnect_all', 'POST');
+        await refreshBleStatus();
+      } catch (err) {
+        alert(err.message);
+      }
+    });
+
+    document.getElementById('btnFreq').addEventListener('click', async () => {
+      try {
+        const v = document.getElementById('freqSel').value;
+        await api('/api/ble/set_frequency', 'POST', { frequency: v });
+        await refreshBleStatus();
+      } catch (err) {
+        alert(err.message);
+      }
+    });
+
+    document.getElementById('btnBleStart').addEventListener('click', async () => {
+      try {
+        const out = await api('/api/ble/start_stream', 'POST');
+        const d = out.detail || {};
+        const started = (d.started || []).map(x => `${x.name || 'Unknown'} (${x.address || '--'})`).join(', ');
+        const skipped = (d.skipped || []).map(x => `${x.name || 'Unknown'} (${x.address || '--'}): ${x.reason || 'skipped'}`).join(', ');
+        if (started) {
+          alert(`BLE streaming started on ${started}${skipped ? `\\nSkipped -> ${skipped}` : ''}`);
+        } else if (skipped) {
+          alert(`BLE stream did not start. ${skipped}`);
+        }
+        await refreshBleStatus();
+      } catch (err) {
+        alert(err.message);
+      }
+    });
+
+    document.getElementById('btnBleStop').addEventListener('click', async () => {
+      try {
+        await api('/api/ble/stop_stream', 'POST');
+        await refreshBleStatus();
+      } catch (err) {
+        alert(err.message);
+      }
+    });
+
+    refreshLedStatus();
+    refreshBleStatus();
+    refreshCameraStatus();
+    checkAllFocus();
+    setInterval(refreshLedStatus, 2000);
+    setInterval(refreshBleStatus, 800);
+    setInterval(refreshCameraStatus, 2500);
+    setInterval(checkAllFocus, 1000);
+  </script>
+</body>
+</html>

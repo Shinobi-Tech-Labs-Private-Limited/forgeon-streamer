@@ -1,0 +1,86 @@
+# Single authoritative source for all physical calibration-cube dimensions.
+# Every module reads geometry from here — no magic numbers elsewhere.
+# Units: millimetres for everything physical.
+
+cube:
+  # Printed-surface-to-printed-surface distance (measure with calipers across
+  # opposing faces AFTER assembly). NOT the substrate/frame size.
+  size_mm: 500.0
+  # If the pattern plane sits above/below the nominal cube surface (e.g. faces
+  # mounted onto an inner frame), positive = outward along the face normal.
+  pattern_offset_mm: 0.0
+
+charuco:
+  dictionary: DICT_4X4_250
+  # Per-face board layout. Sized for detection at ~3-5 m on a 1.3 MP / 70° FOV
+  # sensor (OV9782 @ 2.8 mm, fx ≈ 933 px): a 110 mm square projects to ~34 px
+  # at 3 m, its 82.5 mm marker to ~26 px. Confirmed by the Level-2 rendered sim
+  # before printing (see simulate.py).
+  squares_x: 4
+  squares_y: 4
+  square_length_mm: 110.0
+  marker_length_mm: 82.5
+  # Minimum white margin between board edge and cube edge (quiet zone; also
+  # keeps corners off the physical edge). Actual margin is derived:
+  # (cube size - squares_x * square_length) / 2 and validated against this.
+  min_margin_mm: 15.0
+
+ids:
+  # Marker IDs are unique across the whole cube: face i (in face_order) uses
+  # [i*stride, i*stride + markers_per_face). Stride > markers_per_face leaves
+  # readable gaps between ranges.
+  stride: 10
+  face_order: [FRONT, RIGHT, BACK, LEFT, TOP, BOTTOM]
+
+printing:
+  dpi: 300
+
+# AS-BUILT mounting corrections for the physical cube (built 2026-08-17).
+# The design (cube_geometry.FACE_AXES / print assets / handbook) assumes every
+# tile pasted upright per the cross net. Some tiles went on a quarter- or
+# half-turn off; the values below are the measured deviation, degrees
+# COUNTER-CLOCKWISE as seen from OUTSIDE the cube looking at that face,
+# quarter turns only. Derived from face-adjacency in build photos (which face
+# a print's "down" points toward), not from gravity. Faces omitted = 0.
+#   TOP    : verified in 3 photos (print-right -> RIGHT print, print-down -> FRONT print)
+#   BOTTOM : verified (print-right -> +X, print-down -> +Y with FRONT adjacent)
+#   FRONT  : print upside down (print-down points at TOP)              -> 180
+#   RIGHT  : print-right points at TOP, print-down points at BACK      -> 90 CCW
+#   LEFT   : print-right points at BOTTOM, print-down points at BACK   -> 270 CCW (90 CW)
+#   BACK   : verified (BACK+TOP two-face PnP 1.4 px; other turns 140-200 px)  -> 0
+# If a face is ever re-pasted, re-measure and update here — nothing else.
+mounting:
+  face_rotation_deg:
+    FRONT: 180
+    RIGHT: 90
+    LEFT: 270
+  # Off-centre pastes: pattern centre relative to the face centre, mm, as
+  # (right, up) seen from OUTSIDE the cube in the cross-net orientation (side
+  # faces: viewer standing upright at that face; TOP: up = toward BACK; BOTTOM:
+  # up = toward FRONT). Derived from measured white margins (design 30 mm each
+  # side): shift = (opposite margin - this margin) / 2, i.e. toward the side with
+  # the SMALLER margin. Photo-checked (two-face PnP improves for every face when
+  # applied, worsens when negated). Measured 2026-08-17:
+  #   FRONT : top 24 / bottom 32                     -> up +4
+  #   RIGHT : left 25 / right 32                     -> right -3.5
+  #   BACK  : top 34 / bottom 24                     -> up -5
+  #   LEFT  : left 23 / right 36, top 33 / bottom 26 -> right -6.5, up -3.5
+  #   TOP, BOTTOM: not measured (assumed centred); unmeasured axes assumed 0.
+  # NOTE: margins per axis summed to 56-59 mm, not 60 -> check the print scale
+  # (110 mm square, 440 mm board) and cube.size_mm face-to-face.
+  face_shift_mm:
+    FRONT: {right: 0.0, up: 4.0}
+    RIGHT: {right: -3.5, up: 0.0}
+    BACK:  {right: 0.0, up: -5.0}
+    LEFT:  {right: -6.5, up: -3.5}
+
+# Camera specs used by the sizing/rendering simulations (not by calibration
+# itself — real intrinsics always come from per-unit intrinsic calibration).
+cameras:
+  ov9782_2p8mm:
+    width: 1280
+    height: 800
+    # fx = focal / pixel_pitch = 2.8 mm / 3 um
+    fx_px: 933.0
+    fy_px: 933.0
+    note: Arducam OV9782 global shutter, 2.8 mm lens, ~70 deg HFOV (indoor rig)

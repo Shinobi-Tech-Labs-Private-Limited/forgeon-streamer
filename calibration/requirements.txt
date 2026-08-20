@@ -1,0 +1,12 @@
+# Standalone requirements for the calibration-cube system.
+# The backend venv already satisfies all of these — this file exists so the
+# package can run outside the Forgeon backend (e.g. on a capture laptop).
+# opencv pin matches backend/requirements.txt (4.9.x = last numpy 1.x build;
+# CharucoDetector needs >= 4.7).
+opencv-contrib-python==4.9.0.80
+numpy>=1.26,<2
+PyYAML>=6.0
+matplotlib>=3.8
+Pillow>=10.0
+# optional: PDF verification in scripts/calib_verify_print_files.py
+pymupdf>=1.24
