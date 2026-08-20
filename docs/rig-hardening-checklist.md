@@ -14,14 +14,15 @@
 >   R16 (per-request timeout, mtime prefilter, heartbeat-devices 409) ·
 >   R17 V11-half (STALE/503 focus gate on `_preview_is_healthy`; V13's cube/board `measure_frame` kept) ·
 >   R18 V11-internal (`CAMERA_HOSTS`/`CAMERA_STREAM_ROLES` single source) ·
->   R19 full (SessionLogHandler, per-subsystem logs, `log_exception`, global error handler, print conversion).
+>   R19 full (SessionLogHandler, per-subsystem logs, `log_exception`, global error handler, print conversion) ·
+>   R7 (BLE insole WAL: fsync-cadence write-ahead log, frozen L/R map, atomic replace,
+>   clear-after-durable, startup recovery, `wal_errors`) ·
+>   R4 V11-half (validator `header_ok` WAV tolerance check).
 > - **Ported but dormant**: R12 inbound token gate (`RIG_API_TOKEN`, default unset = open). Enablement
 >   and the rig→cloud auth story are designed together in `docs/direct-upload-design.md` (Decision #9).
-> - **Already present in V13 before this branch**: R7 (BLE WAL — full sub-list verified: WAL fsync
->   cadence, frozen L/R map, atomic replace, clear-after-durable, startup recovery, `wal_errors`) ·
->   R17 standalone half (normalized scorer, conditional CAP_DSHOW, lazy readers, stale-503 —
->   `codesharpnessmeasure/` carried the hardened lineage and evolved cube/board targets on top) ·
->   R4 V11-half (validator `header_ok` tolerance check).
+> - **Already present in V13 before this branch**: R17 standalone half (normalized scorer,
+>   conditional CAP_DSHOW, lazy readers, stale-503 — `codesharpnessmeasure/` carried the hardened
+>   lineage and evolved cube/board targets on top).
 > - **Deferred as-is (deliberate, 2026-08-20)**: all mic/audio hardening — R1–R6 mic parts,
 >   R14 mic sites, R4 Pi half. `mic_capture_manager.py` / `remote_inmp441_capture.py` stay at their
 >   rig (unhardened) versions; the hardened implementations remain on forgeon
