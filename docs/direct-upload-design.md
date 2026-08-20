@@ -67,8 +67,11 @@ interface with two implementations).
 
 In `app35_cam_sole.py`:
 
-- A persistent upload queue (JSON file under `SESSION_DIR/upload_queue.json`, survives app
-  restart) + one background worker thread (uploads are I/O-bound; the GIL objection to R15's
+- A persistent upload queue at the APP level — `BASE_DIR/upload_queue.json` — NOT under
+  `SESSION_DIR`: a new session dir is stamped at every app launch, so a session-scoped queue
+  would orphan the previous session's pending balls on restart. Entries reference recording
+  dirs by path relative to `BASE_DIR`, so balls from any past session remain uploadable.
+  One background worker thread drains it (uploads are I/O-bound; the GIL objection to R15's
   *processing* worker doesn't apply to pure uploads).
 - New routes (browser → rig, LAN):
   - `POST /api/upload_instance` — "upload recording N as assessment X / instance M with these
