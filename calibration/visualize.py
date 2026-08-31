@@ -33,6 +33,7 @@ def load_calibration_yaml(path: str | Path) -> dict[str, np.ndarray]:
 
 
 def _draw_cube(ax, model: CubeModel) -> None:
+    """Draw the cube wireframe, every face's corners, outward normals and the cube axes."""
     half = model.cfg.cube_size_mm / 2.0
     corners = np.array(
         [[sx, sy, sz] for sx in (-half, half) for sy in (-half, half) for sz in (-half, half)]
@@ -41,6 +42,8 @@ def _draw_cube(ax, model: CubeModel) -> None:
         (0, 1), (0, 2), (0, 4), (3, 1), (3, 2), (3, 7),
         (5, 1), (5, 4), (5, 7), (6, 2), (6, 4), (6, 7),
     ]
+    # corners[] enumerates sign combinations as 3-bit indices (x, y, z); an
+    # edge joins two indices that differ in exactly one bit.
     for i, j in edges:
         ax.plot(*zip(corners[i], corners[j]), color="0.55", lw=1.0)
 
@@ -64,11 +67,14 @@ def _draw_cube(ax, model: CubeModel) -> None:
 
 
 def _draw_camera(ax, name: str, T_cube_from_camera: np.ndarray, scale_mm: float) -> None:
+    """Draw one camera (centre, RGB = camera x/y/z axes, frustum) from T_cube_from_camera."""
     centre = T_cube_from_camera[:3, 3]
     R = T_cube_from_camera[:3, :3]  # columns = camera x, y, z axes in cube frame
     ax.scatter(*centre, s=45, color="black", marker="o", depthshade=False)
     for axis_idx, colour in ((0, "r"), (1, "g"), (2, "b")):
         d = R[:, axis_idx] * scale_mm * (2.0 if axis_idx == 2 else 1.0)
+        # Optical axis (+z, blue) drawn twice as long so viewing direction reads
+        # at a glance.
         ax.quiver(*centre, *d, color=colour, arrow_length_ratio=0.12)
 
     # Small frustum along +z (optical axis), ~70 deg HFOV proportions.
@@ -79,6 +85,7 @@ def _draw_camera(ax, name: str, T_cube_from_camera: np.ndarray, scale_mm: float)
          [half_w, half_h, depth], [-half_w, half_h, depth]]
     )
     corners_cube = corners_cam @ R.T + centre
+    # Camera-frame frustum corners into the cube frame (same as transform_points).
     for corner in corners_cube:
         ax.plot(*zip(centre, corner), color="0.3", lw=0.8)
     loop = np.vstack([corners_cube, corners_cube[:1]])
@@ -99,6 +106,7 @@ def visualize(
 
     if not show:
         matplotlib.use("Agg")
+        # Headless backend must be selected before pyplot is first imported.
     import matplotlib.pyplot as plt
 
     fig = plt.figure(figsize=(11, 9))

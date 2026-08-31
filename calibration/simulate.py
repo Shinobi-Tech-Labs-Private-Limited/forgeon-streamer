@@ -7,6 +7,15 @@ Proves the coordinate conventions and multi-camera chaining are correct.
 
 Level 2 (rendering.py): the same scene rendered as actual images from the
 generated face prints, pushed through the real detection pipeline.
+
+Also here: ``detection_distance_sweep`` (how far a camera spec can see the
+cube; fixed the square size before printing) and Level 3,
+``construction_tolerance_study`` (Monte-Carlo of an imperfectly built cube
+against the ideal model, giving a build-error budget).
+
+All camera poses in this module are GROUND TRUTH built with
+``T_cube_from_camera_lookat`` and inverted to T_camera_from_cube before use;
+errors are reported as rotation (deg) and camera-centre distance (mm).
 """
 
 from __future__ import annotations
@@ -33,6 +42,10 @@ MAX_VIEW_ANGLE_DEG = 70.0
 
 
 def camera_matrix_for(spec: CameraSpec) -> np.ndarray:
+    """Ideal pinhole K for a CameraSpec: principal point at the exact image centre.
+
+    (w - 1) / 2 uses the pixel-centre convention, matching cv2.projectPoints.
+    """
     return np.array(
         [
             [spec.fx_px, 0.0, (spec.width - 1) / 2.0],
@@ -57,6 +70,8 @@ def T_cube_from_camera_lookat(
     z = target - pos
     z = z / np.linalg.norm(z)
     x = np.cross(z, up_cube)
+    # Camera +X (image-right) is perpendicular to both the view direction and
+    # world up; +Y = z x x then points image-DOWN, as OpenCV expects.
     if np.linalg.norm(x) < 1e-9:  # looking straight up/down: pick any right
         x = np.array([1.0, 0.0, 0.0])
     x = x / np.linalg.norm(x)
@@ -65,6 +80,8 @@ def T_cube_from_camera_lookat(
     T = np.eye(4)
     T[:3, :3] = np.column_stack([x, y, z])
     T[:3, 3] = pos
+    # Columns are the camera axes in cube coordinates and the translation is
+    # the camera position, i.e. this is T_cube_from_camera (not its inverse).
     return T
 
 
@@ -75,6 +92,8 @@ def visible_faces(model: CubeModel, camera_pos_cube_mm: np.ndarray) -> list[str]
     for face in model.cfg.face_order:
         normal = model.outward_normal(face)
         to_camera = np.asarray(camera_pos_cube_mm, dtype=np.float64) - normal * half
+        # Measure the view angle from the face CENTRE, not the cube centre: a
+        # camera can be well off-axis of the cube yet still see a face square on.
         distance = np.linalg.norm(to_camera)
         if distance < 1e-9:
             continue
@@ -86,6 +105,12 @@ def visible_faces(model: CubeModel, camera_pos_cube_mm: np.ndarray) -> list[str]
 
 @dataclass
 class SyntheticObservation:
+    """Noise-free or noisy 2D<->3D pairs a perfect detector would return for one view.
+
+    Same row-aligned layout as ``detection.CubeDetection``: cube-frame mm
+    against pixel positions, plus the face of every row.
+    """
+
     object_points_cube_mm: np.ndarray
     image_points_px: np.ndarray
     faces: tuple[str, ...]
@@ -134,6 +159,8 @@ def synthesize_observation(
     if noise_px > 0:
         rng = rng or np.random.default_rng(0)
         img = img + rng.normal(0.0, noise_px, size=img.shape)
+    # Note the noise is added BEFORE the in-image test below, so a point
+    # jittered across the border is dropped exactly as a real edge point would be.
 
     width, height = image_size
     in_camera = obj @ T_camera_from_cube[:3, :3].T + T_camera_from_cube[:3, 3]
@@ -153,6 +180,13 @@ def synthesize_observation(
 
 @dataclass
 class Level1CameraResult:
+    """Recovered vs ground-truth pose for one simulated camera.
+
+    ``rotation_error_deg`` is the geodesic angle between the recovered and true
+    R_camera_from_cube; ``translation_error_mm`` is the distance between the
+    recovered and true camera centres in the cube frame.
+    """
+
     name: str
     ground_truth_T_camera_from_cube: np.ndarray
     extrinsics: CameraExtrinsics
@@ -301,6 +335,13 @@ def run_level2(
 
 @dataclass
 class SweepRow:
+    """One distance step of ``detection_distance_sweep``.
+
+    ``marker_px`` is the analytic fronto-parallel marker size
+    fx * marker_length / distance (an upper bound; oblique faces project
+    smaller). Errors are None when no unambiguous pose was recovered.
+    """
+
     distance_mm: float
     marker_px: float          # projected marker side length
     n_faces_detected: int
@@ -336,6 +377,9 @@ def detection_distance_sweep(
     rows: list[SweepRow] = []
     for distance in distances_mm:
         direction = np.array([0.55, -0.8, 0.16]) if oblique else np.array([0.0, -1.0, 0.1])
+        # Oblique: front-right and slightly above, so FRONT and RIGHT are both
+        # within the 70 deg view limit (two faces -> non-planar PnP). Non-oblique
+        # looks almost straight at FRONT, the single-face worst case.
         pos = direction / np.linalg.norm(direction) * distance
         T_cube_from_cam = T_cube_from_camera_lookat(pos)
         T_cam_from_cube = invert_T(T_cube_from_cam)
@@ -418,12 +462,21 @@ def _perturbed_physical_corners(
 
 
 def transform_points_via(model: CubeModel, face: str, pts_board: np.ndarray) -> np.ndarray:
+    """Board-frame points of ``face`` into the cube frame via the IDEAL T_cube_from_face."""
     T = model.T_cube_from_face[face]
     return pts_board @ T[:3, :3].T + T[:3, 3]
 
 
 @dataclass
 class ToleranceSummary:
+    """Aggregate of ``construction_tolerance_study`` over all trials and cameras.
+
+    Single-camera rotation/translation errors are against ground truth in the
+    cube frame; pairwise errors are the translation error of T_camB_from_camA.
+    ``rms_px_mean`` is what a real capture of such a cube would show, which is
+    deliberately small: build error mostly hides from reprojection RMS.
+    """
+
     n_trials: int
     rotation_error_deg_mean: float
     rotation_error_deg_max: float
@@ -487,9 +540,12 @@ def construction_tolerance_study(
                 (img[:, 0] >= 0) & (img[:, 0] < width)
                 & (img[:, 1] >= 0) & (img[:, 1] < height)
             )
+            # Fewer than 6 in-image points is too thin for a meaningful pose.
             if keep.sum() < 6:
                 continue
             est = estimate_camera_from_cube(ideal[keep], img[keep], K, None)
+            # Key step: pixels come from the PERTURBED cube, but PnP is given
+            # the IDEAL 3D points, exactly as the real solver would be.
             if est.ambiguous:
                 # An IPPE flip is a capture problem, not a construction one —
                 # it would swamp the build-error signal this study isolates.

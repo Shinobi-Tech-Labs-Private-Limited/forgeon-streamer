@@ -31,6 +31,8 @@ def face_print_image(model: CubeModel, face: str, px_per_mm: float = 2.0) -> np.
     board_py = int(round(cfg.board_height_mm * px_per_mm))
     margin_px = int(round(cfg.margin_mm * px_per_mm))
     board_img = model.face_boards[face].board.generateImage((board_px, board_py), marginSize=0)
+    # Margins are added here (not via generateImage's marginSize) so the white
+    # border is exactly cfg.margin_mm and the board starts at a known pixel.
     return cv2.copyMakeBorder(
         board_img, margin_px, margin_px, margin_px, margin_px,
         cv2.BORDER_CONSTANT, value=255,
@@ -50,6 +52,10 @@ def render_view(
     face_images: dict[str, np.ndarray] | None = None,
 ) -> np.ndarray:
     """Render one grayscale camera view of the cube (uint8, width x height)."""
+    # For each visible face: project the four corners of the full face artwork
+    # (board + margins) with the pinhole model, then warp the artwork onto those
+    # pixels with a homography. A plane under a pinhole camera IS a homography,
+    # so the result is geometrically exact; blur and noise approximate optics.
     cfg = model.cfg
     width, height = image_size
     canvas = np.full((height, width), background, dtype=np.uint8)
@@ -64,6 +70,8 @@ def render_view(
         h_px, w_px = art.shape[:2]
 
         # Face artwork corners in board-frame mm (pixel-centre convention).
+        # -0.5 / (n - 0.5): the artwork's outer edge lies half a pixel outside
+        # the first/last pixel centres; this keeps the warped size true.
         m = cfg.margin_mm
         src_px = np.array(
             [[-0.5, -0.5], [w_px - 0.5, -0.5], [w_px - 0.5, h_px - 0.5], [-0.5, h_px - 0.5]],
@@ -92,12 +100,15 @@ def render_view(
             np.full_like(art, 255), H, (width, height), flags=cv2.INTER_NEAREST,
             borderMode=cv2.BORDER_CONSTANT, borderValue=0,
         )
+        # Nearest-neighbour mask gives a hard face outline; the bilinear warp
+        # above would otherwise leak a dark border pixel around each face.
         canvas[mask > 127] = warped[mask > 127]
 
     if blur_sigma_px > 0:
         canvas = cv2.GaussianBlur(canvas, (0, 0), blur_sigma_px)
     if noise_sigma > 0:
         rng = rng or np.random.default_rng(0)
+        # Fixed default seed keeps the sims and tests reproducible.
         noisy = canvas.astype(np.float64) + rng.normal(0.0, noise_sigma, canvas.shape)
         canvas = np.clip(noisy, 0, 255).astype(np.uint8)
     return canvas

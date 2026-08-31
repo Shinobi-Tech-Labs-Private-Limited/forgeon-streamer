@@ -30,6 +30,16 @@ from .pose import PoseEstimate, average_poses, invert_T, pose_spread
 
 @dataclass
 class CameraExtrinsics:
+    """Fused extrinsics of one camera plus the statistics that justify them.
+
+    ``T_camera_from_cube`` is the SE(3) mean of the accepted per-image poses
+    (cube-frame mm into camera frame). ``rms_px``/``median_px``/``max_px`` pool
+    the per-point reprojection residuals of every accepted image. The two
+    ``pose_*_spread`` fields are the largest rotation (deg) and translation
+    (mm) distance of any accepted image pose from the mean: large values mean
+    the cube or camera moved, or the intrinsics are wrong.
+    """
+
     name: str
     T_camera_from_cube: np.ndarray
     n_images_used: int
@@ -42,10 +52,12 @@ class CameraExtrinsics:
 
     @property
     def T_cube_from_camera(self) -> np.ndarray:
+        """Inverse pose: camera-frame points into the cube frame."""
         return invert_T(self.T_camera_from_cube)
 
     @property
     def camera_centre_cube_mm(self) -> np.ndarray:
+        """Optical centre of the camera in cube coordinates, mm."""
         return self.T_cube_from_camera[:3, 3]
 
 
@@ -64,6 +76,9 @@ def combine_camera_estimates(
         e for e in estimates
         if e.rms_px <= max_rms_px and not (reject_ambiguous and e.ambiguous)
     ]
+    # max_rms_px = 3 px is far above the ~0.3-1 px a good frame gives, so it
+    # removes gross failures (mis-oriented face, bad detection) rather than
+    # trimming ordinary noise.
     if not kept:
         raise ValueError(
             f"{name}: no usable pose estimates "
@@ -86,6 +101,11 @@ def combine_camera_estimates(
 
 
 def T_camB_from_camA(cam_a: CameraExtrinsics, cam_b: CameraExtrinsics) -> np.ndarray:
+    """Relative pose mapping camera-A coordinates into camera-B coordinates.
+
+    T_camB_from_camA = T_camB_from_cube @ T_cube_from_camA. Both cameras must
+    have been solved against the same cube placement.
+    """
     return cam_b.T_camera_from_cube @ cam_a.T_cube_from_camera
 
 
@@ -101,6 +121,7 @@ FORWARD_FACE_YAW_DEG = {"BACK": 0.0, "RIGHT": 90.0, "FRONT": 180.0, "LEFT": -90.
 
 
 def _rot_z(deg: float) -> np.ndarray:
+    """3x3 rotation about +Z by ``deg`` degrees, counter-clockwise seen from above (+Z)."""
     c, s = np.cos(np.radians(deg)), np.sin(np.radians(deg))
     return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
 
@@ -143,6 +164,7 @@ class WorldFrame:
 
     @property
     def is_identity(self) -> bool:
+        """True when the world frame coincides with the cube frame (legacy output)."""
         return (
             self.origin == "cube_center"
             and self.forward_face == "BACK"
@@ -162,6 +184,12 @@ class WorldFrame:
         return -self.contact_height_mm(cfg)
 
     def T_world_from_cube(self, cfg: CalibrationConfig) -> np.ndarray:
+        """4x4 transform taking cube-frame points into this world frame.
+
+        T_world_from_cube = Rz(yaw_of(forward_face) + yaw_deg) then, for the
+        floor origin, a +Z shift of ``contact_height_mm`` so the ground plane
+        becomes world Z = 0 and the cube centre sits at (0, 0, contact).
+        """
         R = _rot_z(FORWARD_FACE_YAW_DEG[self.forward_face] + self.yaw_deg)
         T = np.eye(4)
         T[:3, :3] = R
@@ -171,6 +199,7 @@ class WorldFrame:
         return T
 
     def describe(self, cfg: CalibrationConfig) -> dict:
+        """Plain-data description of the frame for the ``world`` block of calibration.yaml."""
         contact = self.contact_height_mm(cfg)
         d: dict = {
             "origin": self.origin,
@@ -198,10 +227,12 @@ class WorldFrame:
 
 
 def T_camera_from_world(cam: "CameraExtrinsics", T_world_from_cube: np.ndarray) -> np.ndarray:
+    """T_camera_from_world = T_camera_from_cube @ T_cube_from_world (re-based extrinsic)."""
     return cam.T_camera_from_cube @ invert_T(T_world_from_cube)
 
 
 def camera_centre_world_mm(cam: "CameraExtrinsics", T_world_from_cube: np.ndarray) -> np.ndarray:
+    """Camera optical centre expressed in the world frame, mm (Z = height above floor)."""
     return (T_world_from_cube @ np.append(cam.camera_centre_cube_mm, 1.0))[:3]
 
 

@@ -12,6 +12,11 @@ Pipeline per image:
 4. Map every ChArUco corner (face, local_id) -> global cube 3D point, giving
    the 2D<->3D correspondences for PnP. Marker corners can be appended as
    supplementary correspondences (marker CENTRES are never used).
+
+On the rig this module is what codesharpnessmeasure/focus/charuco.py uses to
+find the cube in preview frames (``CubeDetector.detect(frame,
+min_markers_per_face=1)``); the solver path additionally feeds the returned
+correspondences into pose.estimate_camera_from_cube.
 """
 
 from __future__ import annotations
@@ -35,6 +40,7 @@ FACE_COLOURS = {
 
 
 def _tuned_detector_parameters() -> "cv2.aruco.DetectorParameters":
+    """ArUco detector parameters tuned for large, sparse markers seen at 2-4 m."""
     # Based on the field-tuned parameters in
     # player_anthropometrics/anthropometric_analysis_rtmlib.py, except
     # minMarkerDistanceRate: 0.01 there (tuned for one lone marker) lets the
@@ -56,6 +62,15 @@ def _tuned_detector_parameters() -> "cv2.aruco.DetectorParameters":
 
 @dataclass
 class FaceDetection:
+    """Everything detected on ONE cube face in one image.
+
+    ``marker_corners_px[i]`` are the four image corners of ``marker_ids[i]`` in
+    OpenCV order (print top-left, top-right, bottom-right, bottom-left), pixels.
+    ``charuco_corners_px[k]`` is the sub-pixel image position of the interior
+    chessboard corner whose local ID is ``charuco_local_ids[k]``; that ID indexes
+    ``CubeModel.chessboard_corners_cube[face]``.
+    """
+
     face: str
     marker_ids: list[int]
     marker_corners_px: list[np.ndarray]              # each (4, 2)
@@ -65,6 +80,16 @@ class FaceDetection:
 
 @dataclass
 class CubeDetection:
+    """Result of ``CubeDetector.detect`` for one image.
+
+    ``faces`` holds only faces that produced at least one interpolated ChArUco
+    corner. The stacked arrays are the PnP input: row i of
+    ``object_points_cube_mm`` (cube frame, mm) is observed at row i of
+    ``image_points_px`` (pixels) and lies on face ``point_faces[i]``.
+    ``unknown_marker_ids`` are detected IDs that belong to no cube face (e.g.
+    the flat intrinsics board or stray codes); they are ignored, not an error.
+    """
+
     faces: dict[str, FaceDetection] = field(default_factory=dict)
     unknown_marker_ids: list[int] = field(default_factory=list)
     # Stacked 2D<->3D correspondences across all faces:
@@ -74,14 +99,22 @@ class CubeDetection:
 
     @property
     def n_correspondences(self) -> int:
+        """Number of stacked 2D<->3D pairs (PnP needs >= 4)."""
         return int(self.object_points_cube_mm.shape[0])
 
     @property
     def visible_faces(self) -> list[str]:
+        """Names of faces with usable ChArUco corners, in detection order."""
         return list(self.faces.keys())
 
 
 class CubeDetector:
+    """Stateful detector: one ArucoDetector plus one CharucoDetector per face.
+
+    Construct once and reuse (the focus scorer keeps a module-level instance);
+    ``detect`` is safe to call repeatedly on frames of any resolution.
+    """
+
     def __init__(self, model: CubeModel):
         self.model = model
         self._aruco = cv2.aruco.ArucoDetector(
@@ -104,6 +137,24 @@ class CubeDetector:
         min_markers_per_face: int = 2,
         include_marker_corners: bool = True,
     ) -> CubeDetection:
+        """Detect the cube in one BGR or grayscale image.
+
+        Args:
+            image: uint8 image, (H, W) grayscale or (H, W, 3) BGR.
+            min_markers_per_face: faces with fewer identified markers are
+                skipped. The solver default of 2 avoids interpolating a whole
+                face from one marker; the focus scorer passes 1 because it only
+                needs a crop region, not a pose.
+            include_marker_corners: also stack the 4 corners of every accepted
+                marker as extra 2D<->3D pairs (their 3D positions come from the
+                board geometry, so keep ``marker_length_mm`` exact).
+
+        Returns:
+            A CubeDetection. A face whose markers were seen but whose ChArUco
+            interpolation returned no corners is dropped entirely (it appears
+            neither in ``faces`` nor in the stacked points). Nothing here uses
+            intrinsics; the returned pixels are raw (distorted) coordinates.
+        """
         gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
         scale = min(1.0, self.MAX_DETECT_DIM / max(gray.shape))
@@ -118,6 +169,8 @@ class CubeDetector:
             return result
         if scale < 1.0:
             corners = [c / scale for c in corners]
+            # Marker corners were found on the downscaled copy; bring them
+            # back to full-resolution pixel coordinates.
 
         # Group marker detections by face, keeping ONE detection per marker ID
         # (largest perimeter wins — duplicates would double-weight the PnP and
@@ -155,6 +208,8 @@ class CubeDetector:
             ch_corners, ch_ids, _, _ = self._charuco[face].detectBoard(
                 gray, markerCorners=face_marker_corners, markerIds=face_marker_ids
             )
+            # Markers alone give no sub-pixel corners, so such a face is dropped
+            # from the result entirely (see the detect() docstring).
             if ch_ids is None or len(ch_ids) == 0:
                 continue
 
@@ -169,6 +224,8 @@ class CubeDetector:
             )
 
             cube_pts = self.model.chessboard_corners_cube[face][local_ids]
+            # Local corner ID == row index of the face's corner table, so the
+            # (face, local_id) -> cube-frame 3D lookup is a plain fancy-index.
             object_points.append(cube_pts)
             image_points.append(corners_px)
             point_faces.extend([face] * len(local_ids))

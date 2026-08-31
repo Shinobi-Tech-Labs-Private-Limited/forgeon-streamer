@@ -11,12 +11,40 @@ Upload (uses a real recorded file from the rig's disk):
       --view side=sessions/session_.../recording_1/sync/cam1_sync_side.mp4 \
       --view front=sessions/session_.../recording_1/sync/cam2_sync_front.mp4 \
       --params '{"ball_speed": 120, "delivery_type": "normal"}'
+
+Status (see docs/direct-upload-design.md): --register is superseded by the
+in-app pairing flow (/pair in app35_cam_sole.py), and the upload path is what
+upload_worker.py now does in production. Keep this script as a manual driver
+for exercising the cloud API in isolation: it performs the same three calls
+as the worker (init -> PUT -> complete) with no queue, no retries and no
+.uploaded marker. Nothing in the app imports it.
+
+Differences from upload_worker.py, useful when comparing behaviour:
+  - any HTTP error prints the status + body and exits the process;
+  - a network-level error (no route, DNS) is not caught and shows a traceback;
+  - only camera views are sent (no hr_file / insole_file, no total_instances);
+  - paths are taken as given (relative to the CWD), not relative to BASE_DIR.
+
+The device token travels in plain argv; do not paste it into logs or docs.
 """
 import argparse, json, os, sys, urllib.request, urllib.error
 
 API = "https://api-dev-new.forgelabs.in/dev"
 
 def call(method, url, data=None, headers=None, raw=False):
+    """One HTTP request; returns (status, decoded JSON body).
+
+    Args:
+        method / url: as for urllib.
+        data: dict sent as JSON, or raw bytes when raw=True (used for the
+            form-encoded /login and for the file bytes PUT to GCS).
+        headers: extra headers (Authorization; Content-Type for raw bodies).
+
+    A non-2xx status prints the first 400 bytes of the response and exits 1:
+    this is a test driver, so the first failure should stop the run instead
+    of cascading. The 300 s timeout is sized for one video PUT on slow wifi.
+    An empty body decodes as {}; a non-JSON body raises.
+    """
     body = data if raw else (json.dumps(data).encode() if data is not None else None)
     req = urllib.request.Request(url, data=body, method=method, headers=headers or {})
     if not raw and data is not None:
@@ -30,6 +58,14 @@ def call(method, url, data=None, headers=None, raw=False):
         sys.exit(1)
 
 def main():
+    """Parse args and run either the one-off --register or the upload flow.
+
+    --register: form-login as an admin, then POST /rig/devices to mint a
+    device row; prints the device token (the API shows it once) and the
+    lan_token. Upload: build the manifest from --view name=path pairs (name
+    becomes the API field "<name>_view"), init, PUT each file to its resumable
+    session URL, complete; prints the created instance id and status.
+    """
     ap = argparse.ArgumentParser()
     ap.add_argument("--api", default=API)
     ap.add_argument("--register", action="store_true", help="mint a new device token (admin login required)")
@@ -59,12 +95,16 @@ def main():
     files = {}
     for spec in a.view:
         name, path = spec.split("=", 1)
+        # side=... -> side_view: the multipart field names of the
+        # upload-instance API (same mapping as VIEW_FIELD_MAPPING in the app).
         field = f"{name}_view"
         files[field] = path
         assert os.path.exists(path), f"missing file: {path}"
 
     manifest = [{"field": f, "filename": os.path.basename(p), "size_bytes": os.path.getsize(p)}
                 for f, p in files.items()]
+    # Per the design doc, /complete verifies the uploaded objects against
+    # these declared sizes, so a wrong size_bytes fails at step [3], not here.
     print("[1] init:", [(m["field"], f"{m['size_bytes']/1e6:.1f} MB") for m in manifest])
     st, init = call("POST", f"{a.api}/rig/instances/init", {
         "assessment_id": a.assessment, "instance_no": a.instance, "files": manifest,

@@ -2,6 +2,12 @@
 
 All physical dimensions flow from here. Modules must take a CalibrationConfig
 rather than re-declaring lengths.
+
+Two kinds of value live in config.yaml: the DESIGN (cube size, board layout,
+marker-ID layout, print DPI) and the AS-BUILT mounting corrections measured on
+the physical cube (per-face quarter-turn rotation and off-centre paste shift).
+The as-built values are what make the solver see the real cube; never edit
+config.yaml unless a face has physically been re-pasted and re-measured.
 """
 
 from __future__ import annotations
@@ -20,6 +26,7 @@ class CameraSpec:
     """Sensor/lens spec used only by the simulators."""
 
     name: str
+    # Image size in pixels and focal lengths in pixel units (fx = f / pixel pitch).
     width: int
     height: int
     fx_px: float
@@ -29,6 +36,13 @@ class CameraSpec:
 
 @dataclass(frozen=True)
 class CalibrationConfig:
+    """Validated, immutable view of config.yaml plus derived geometry.
+
+    Lengths are millimetres. ``face_order`` fixes the marker-ID allocation:
+    face i uses IDs [i * id_stride, i * id_stride + markers_per_face). Build it
+    with ``CalibrationConfig.load()``; the constructor does not validate.
+    """
+
     cube_size_mm: float
     pattern_offset_mm: float
     dictionary_name: str
@@ -55,10 +69,12 @@ class CalibrationConfig:
 
     @property
     def board_width_mm(self) -> float:
+        """Printed board width (squares_x * square length), mm, excluding margins."""
         return self.squares_x * self.square_length_mm
 
     @property
     def board_height_mm(self) -> float:
+        """Printed board height (squares_y * square length), mm, excluding margins."""
         return self.squares_y * self.square_length_mm
 
     @property
@@ -68,20 +84,24 @@ class CalibrationConfig:
 
     @property
     def markers_per_face(self) -> int:
+        """Number of ArUco markers on one face's board."""
         # New (non-legacy) ChArUco pattern: first square black, markers on the
         # white squares -> floor(squares/2).
         return (self.squares_x * self.squares_y) // 2
 
     @property
     def chessboard_corners_per_face(self) -> int:
+        """Number of interior ChArUco corners on one face (local IDs 0..N-1)."""
         return (self.squares_x - 1) * (self.squares_y - 1)
 
     @property
     def aruco_dictionary(self) -> "cv2.aruco.Dictionary":
+        """The predefined cv2.aruco dictionary named by ``dictionary_name``."""
         return cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, self.dictionary_name))
 
     @property
     def dictionary_size(self) -> int:
+        """Number of marker codes in the dictionary (highest usable ID + 1)."""
         return int(self.aruco_dictionary.bytesList.shape[0])
 
     def rotation_for_face(self, face: str) -> int:
@@ -94,6 +114,7 @@ class CalibrationConfig:
         return float(r), float(u)
 
     def marker_ids_for_face(self, face: str) -> list[int]:
+        """The contiguous, cube-unique ArUco marker IDs allocated to ``face``."""
         idx = self.face_order.index(face)
         start = idx * self.id_stride
         return list(range(start, start + self.markers_per_face))
@@ -102,6 +123,11 @@ class CalibrationConfig:
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "CalibrationConfig":
+        """Read a YAML config (default: calibration/config.yaml), validate, return it.
+
+        Raises ValueError (via ``validate``) if the geometry or ID layout is
+        inconsistent, and KeyError if a required section is missing.
+        """
         path = Path(path) if path else DEFAULT_CONFIG_PATH
         with open(path, "r", encoding="utf-8") as f:
             raw = yaml.safe_load(f)
@@ -136,6 +162,14 @@ class CalibrationConfig:
         return cfg
 
     def validate(self) -> None:
+        """Check geometric and ID-layout invariants; raise ValueError listing all problems.
+
+        Checks: all six faces named once; marker fits inside its square; the
+        board leaves at least ``min_margin_mm`` of white on each side; per-face
+        ID ranges do not overlap and fit in the dictionary; as-built rotations
+        are quarter turns of known faces; as-built shifts keep the pattern on
+        the face.
+        """
         problems: list[str] = []
         if sorted(self.face_order) != sorted(["FRONT", "RIGHT", "BACK", "LEFT", "TOP", "BOTTOM"]):
             problems.append(f"face_order must name the six cube faces exactly once, got {self.face_order}")
