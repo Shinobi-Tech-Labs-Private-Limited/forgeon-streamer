@@ -1,3 +1,84 @@
+"""Forgeon rig streamer - production entry point.
+
+One Flask process (port 5000) runs a multimodal sports-assessment recording
+rig. Everything an operator does from the browser UI lands here.
+
+Hardware / subsystems
+  * 3 Raspberry Pi cameras (cam1 = side, cam2 = front, cam3 = back) serving
+    MJPEG over RTSP via v4l2rtspserver. This app SSHes into each Pi to
+    (re)start that server and keep it healthy (camera bootstrap), keeps a
+    low-latency preview loop per camera for the UI, and records every stream
+    with one FFmpeg process per camera at TARGET_FPS_WRITE.
+  * 2 BLE pressure insoles (Left / Right) streaming 8-channel ADC samples at
+    up to 200 Hz - InsoleDevice / BleCoordinator (bleak on a private asyncio
+    loop thread).
+  * A BLE heart-rate strap, handled by a sidecar process (heartbeat_manager).
+  * An INMP441 I2S microphone on one of the camera Pis (mic_capture_manager,
+    which runs remote_inmp441_capture.py on the Pi over SSH).
+  * A lens focus stepper on each Pi (lens_move, driven over SSH + lgpio) and
+    a focus scorer (codesharpnessmeasure) that grades the ChArUco cube.
+  * A direct-upload worker (upload_worker.py) that pushes finished takes to
+    the Forgeon cloud. It only exists once the rig is paired (/pair), and
+    pairing is a hard gate on recording (rig_paired()).
+
+Life of a take (start_combined / stop_combined)
+  start: check sport + calibration -> arm insole stream and wait for packets
+         -> start mic + HR snippet -> open insole WAL/log -> spawn FFmpeg
+         recorders -> is_recording_evt set
+  stop:  SIGINT the recorders (sensors keep running so they bracket the
+         video end) -> stop insoles / HR / mic -> run_sync_on_dir (trim every
+         camera to the common wall-clock window and window the sensor logs
+         to it) -> postprocess_recording_for_upload (undistort cam1 when the
+         sport needs it) -> validate_recording (validation_report.json)
+
+On-disk layout (BASE_DIR/sessions/)
+  session_<ts>/
+    logs/<subsystem>.log         rig logs (SessionLogHandler, per subsystem)
+    camera_bootstrap/<cam>.log   SSH bootstrap transcripts
+    calibration/                 calibration_cam1.json/.npz, detections, previews
+    snaps/snap_<ts>/<cam>.jpg    calibration / snapshot captures + manifest
+    recording_N/
+      <cam>.mp4, <cam>.log       raw FFmpeg output; the log carries the
+                                 wall-clock "start:" used for synchronisation
+      ble/                       insole WAL (.bin), assignment map, decoded JSON
+      heartbeat/, audio/         HR JSONL and mic WAV
+      sync/                      <cam>_sync_<view>.mp4, ble_sync.json,
+                                 heart_rate_sync.jsonl, sync_manifest.json
+      distorted/                 original cam1 kept aside after undistortion
+      processing_status.json, validation_report.json
+
+Threading model
+  Flask runs threaded. Long-lived daemon threads: one preview capture loop
+  per camera (capture_frames) and one SSH bootstrap monitor per camera
+  (_monitor_camera_backend). BLE work runs on the BleCoordinator's own asyncio
+  loop thread; Flask handlers hop onto it with BleCoordinator._run(). Shared
+  state is module globals guarded by session_state_lock (recording / session
+  transitions), camera_backend_state_lock (bootstrap status) and the
+  per-camera frame_locks. start_new_session() REASSIGNS the SESSION_* /
+  CALIBRATION_* globals, so code that needs the current session must read
+  them at call time - never capture them at import time.
+
+Environment knobs
+  RIG_API_TOKEN, RIG_SSH_STRICT / RIG_SSH_KNOWN_HOSTS, PI_SSH_USER,
+  CAMERA_BOOTSTRAP_ENABLED, FORCE_CUDA_RECORD / REQUIRE_CUDA_RECORD,
+  APP_USE_CASE (default sport), MIC_CAMERA_KEY, RIG_LOG_LEVEL /
+  RIG_BLE_LOG_LEVEL, FORGEON_API_URL / FORGEON_DEVICE_TOKEN (debug override
+  for the pairing file).
+
+Route map (JSON unless noted)
+  UI pages     /  /pair  /calibration  /recording                    (HTML)
+  Preview      /video_feed/<cam> (MJPEG)  /focus/<cam>  /focus/all
+               /focus/reset  /lens/<cam>/move  /lens/<cam>/reset  /lens/status
+  Take/session /api/start_recording  /api/stop_recording  /api/new_session
+               /api/list_recordings  /api/get_recording_files/<n>
+               /api/validate_recording/<n>  /status  /api/camera/status
+               (+ form-post twins /start_recording /stop_recording
+                /new_session /capture_photos /select_sport for the legacy UI)
+  Calibration  /api/calibration/status|capture|run|upload_json  /api/snapshots
+  Sensors      /api/ble/*  (insoles)   /api/heartbeat/*   /api/mic/*
+  Cloud        /api/pairing/status|claim  /api/upload_instance|queue|retry
+  Files        /media/<path> (inline)   /download_file/<path> (attachment)
+"""
 import asyncio
 import argparse
 import atexit
@@ -182,6 +263,7 @@ CAMERA_BOOTSTRAP = {
     },
 }
 
+# ---- Lens focus motor (stepper on each camera Pi, driven via lgpio over SSH)
 # BCM pins on the camera Pi. Chosen to avoid the INMP441 I2S lines.
 LENS_MOTOR_DEFAULT_PINS = {"step": 5, "dir": 6, "en": 13}
 
@@ -198,6 +280,10 @@ lens_position = {k: 0 for k in CAMERA_SOURCES}
 lens_locks = {k: threading.Lock() for k in CAMERA_SOURCES}
 lens_last_error = {k: None for k in CAMERA_SOURCES}
 
+# ---- Preview + recording tunables
+# The preview loop resizes to FRAME_SIZE and is throttled (fps / JPEG quality)
+# while a take is running so the MJPEG generators leave CPU for the encoders.
+# TARGET_FPS_WRITE is the constant frame rate forced on every recording.
 FRAME_SIZE = (1280, 720)  # preview resize only
 
 STREAM_THROTTLE_ON_RECORD = True
@@ -209,9 +295,13 @@ TARGET_FPS_WRITE = 90
 FORCE_CUDA_RECORD = os.environ.get("FORCE_CUDA_RECORD", "").strip().lower() in ("1", "true", "yes", "on")
 REQUIRE_CUDA_RECORD = os.environ.get("REQUIRE_CUDA_RECORD", "").strip().lower() in ("1", "true", "yes", "on")
 
+# Preview capture: give up on a stalled stream after RTSP_TIMEOUT_MS and
+# reconnect with the (cyclic) RTSP_RETRY_BACKOFF delays.
 RTSP_TIMEOUT_MS = 5000
 RTSP_RETRY_BACKOFF = (1, 2, 5)
 
+# Low-latency RTSP input flags shared by snapshot grabs. Recording uses its
+# own, larger-buffered variant in build_ffmpeg_record_cmd().
 FFMPEG_RTSP_INPUT = [
     "-rtsp_transport",
     "tcp",
@@ -233,7 +323,13 @@ FFMPEG_RTSP_INPUT = [
     "500000",
 ]
 
+
 # ==================== BLE Config (from app13) ====================
+# Insole GATT layout. ADC_CHAR notifies batches of SINGLE_SAMPLE_SIZE-byte
+# packets (see InsoleDevice._handle_adc_data for the byte layout); CMD_CHAR
+# takes the one-byte commands below; STATUS_CHAR notifies battery/charging/
+# streaming state. The 0x2Axx UUIDs are the standard Device Information
+# Service characteristics.
 UUID_ADC_CHAR = "aa0a4d54-2b51-42f9-bbca-3b9304fbed92"
 UUID_CMD_CHAR = "7d4a93e2-1b7e-41c5-a2ed-8f0cf19e68e3"
 UUID_STATUS_CHAR = "7d4a93e2-1b22-4a61-95b4-564f0a2c7703"
@@ -252,6 +348,7 @@ SINGLE_SAMPLE_SIZE = 20
 SAMPLES_PER_NOTIFY = 12
 
 # ==================== App Globals ====================
+# The single production template lives in templates/active/ (see CLAUDE.md).
 app = Flask(__name__, template_folder="templates/active")
 CORS(
     app,
@@ -287,6 +384,7 @@ _TOKEN_PROTECTED_PREFIXES = (
 
 @app.before_request
 def _require_rig_token():
+    """Optional bearer-token gate (see RIG_API_TOKEN above). No-op when unset."""
     if not RIG_API_TOKEN:
         return None
     if not request.path.startswith(_TOKEN_PROTECTED_PREFIXES):
@@ -301,6 +399,9 @@ def _require_rig_token():
     return None
 
 
+# Session directory: one folder per app start (or per /api/new_session), every
+# artifact of the rig lands beneath it. These four names are reassigned by
+# start_new_session() - always read them at call time.
 BASE_DIR = Path(__file__).resolve().parent
 SESSION_TIMESTAMP = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 SESSION_DIR = BASE_DIR / "sessions" / f"session_{SESSION_TIMESTAMP}"
@@ -352,10 +453,17 @@ _RIG_LOG_SUBSYSTEMS = ("app", "sync", "ble", "mic", "heartbeat", "bootstrap", "u
 
 
 def _session_log_path(subsystem):
+    """Path provider for SessionLogHandler - resolved on every emit so it follows
+    SESSION_DIR when a new session starts.
+    """
     return lambda: SESSION_DIR / "logs" / f"{subsystem}.log"
 
 
 def _init_rig_logging():
+    """Wire the 'rig' logger tree once: console handler on the root plus one
+    session-scoped file per subsystem in _RIG_LOG_SUBSYSTEMS (rig.app,
+    rig.sync, rig.ble, ...). Safe to call twice.
+    """
     root = logging.getLogger("rig")
     if root.handlers:
         return
@@ -385,21 +493,30 @@ bootstrap_log = logging.getLogger("rig.bootstrap")
 
 
 def log_exception(logger, message):
+    """Log message at ERROR with the current exception's traceback attached."""
     logger.error(message, exc_info=True)
 
 
 @app.errorhandler(Exception)
 def _unhandled_error(exc):
+    """Last-resort Flask error handler: HTTP errors pass through untouched,
+    anything else is logged with a traceback and answered as JSON 500.
+    """
     if isinstance(exc, HTTPException):
         return exc
     log_exception(rig_log, f"Unhandled error in {request.path}")
     return jsonify({"status": "error", "message": str(exc)}), 500
+# ---- Calibration (side camera only). Intrinsics are solved from ChArUco
+# snapshots of cam1; the JSON is what postprocess_recording_for_upload()
+# uses to undistort cam1 for wide-angle sports. Reassigned per session.
 CALIBRATION_DIR = SESSION_DIR / "calibration"
 CALIBRATION_JSON = CALIBRATION_DIR / "calibration_cam1.json"
 CALIBRATION_NPZ = CALIBRATION_DIR / "calibration_cam1.npz"
 CALIBRATION_CAMERA = "cam1"
 CALIBRATION_MIN_IMAGES = 40
 CALIBRATION_MIN_CORNERS = 6
+# The operator picks a sport before recording; it only decides whether
+# calibration/undistortion is mandatory. APP_USE_CASE preselects the default.
 SPORT_OPTIONS = {
     "wide_angle": {
         "label": "Wide-angle Sport",
@@ -416,16 +533,26 @@ DEFAULT_SPORT = os.environ.get("APP_USE_CASE", "wide_angle").strip().lower()
 if DEFAULT_SPORT not in SPORT_OPTIONS:
     DEFAULT_SPORT = "wide_angle"
 selected_sport = None
+# Which camera Pi hosts the INMP441 microphone (None = no mic until the
+# operator assigns one via /api/mic/assign).
 MIC_CAMERA_KEY = os.environ.get("MIC_CAMERA_KEY", "").strip().lower() or None
 if MIC_CAMERA_KEY not in CAMERA_SOURCES:
     MIC_CAMERA_KEY = None
 
+# ---- Preview pipeline state (one entry per camera). capture_frames() writes
+# the newest decoded frame + its wall-clock time under frame_locks; the MJPEG
+# generators, snapshots and the focus scorer read from it. The two event maps
+# tell the capture thread to exit / reopen its RTSP connection.
 frames = {k: None for k in CAMERA_SOURCES}
 frame_ts = {k: 0.0 for k in CAMERA_SOURCES}
 frame_locks = {k: threading.Lock() for k in CAMERA_SOURCES}
 stop_capture_evts = {k: threading.Event() for k in CAMERA_SOURCES}
 reopen_capture_evts = {k: threading.Event() for k in CAMERA_SOURCES}
 
+# ---- Recording state. is_recording_evt is THE flag every route checks;
+# recording_index counts takes within the session (recording_N folders);
+# record_procs / record_logs hold the per-camera FFmpeg Popen + log handle.
+# session_state_lock (re-entrant) serialises start/stop/new-session.
 is_recording_evt = threading.Event()
 recording_index = 0
 recording_start_epoch = None
@@ -434,6 +561,10 @@ session_state_lock = threading.RLock()
 
 record_procs = {}
 record_logs = {}
+# ---- Camera bootstrap (SSH supervisor) state. One monitor thread per camera
+# keeps camera_backend_status[cam] current; every mutation goes through
+# camera_backend_state_lock. *_clients / *_channels are legacy slots from the
+# paramiko era and are only ever cleared today.
 camera_backend_stop_evt = threading.Event()
 camera_backend_threads = {}
 camera_backend_clients = {}
@@ -467,10 +598,14 @@ camera_backend_status = {
     for cam_key, cfg in CAMERA_BOOTSTRAP.items()
 }
 
+# Leave half the cores for FFmpeg; OpenCV is only used for preview/snapshots.
 cv2.setNumThreads(max(1, os.cpu_count() // 2))
 
 
 def calculate_crc16(data):
+    """CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF) as computed by the insole
+    firmware over the first 18 bytes of each ADC packet.
+    """
     crc = 0xFFFF
     for byte in data:
         crc ^= byte << 8
@@ -483,12 +618,24 @@ def calculate_crc16(data):
     return crc
 
 
+
 # ==================== Camera Bootstrap Helpers ====================
+# The rig does not trust the Pis to keep v4l2rtspserver running on their own.
+# For each camera a daemon thread (_monitor_camera_backend) SSHes in, restarts
+# the RTSP server with the exact argv from CAMERA_BOOTSTRAP, then polls a
+# status script every CAMERA_BOOTSTRAP_HEALTHCHECK_SEC and restarts on any
+# failure with CAMERA_BOOTSTRAP_BACKOFF. All remote work is plain bash fed to
+# 'ssh <pi> bash -s' on stdin - nothing needs to be installed on the Pi
+# besides v4l2rtspserver (and python3-lgpio for the lens motor).
 def _camera_backend_log_path(cam_key: str) -> Path:
+    """Per-camera SSH transcript file inside the current session."""
     return camera_backend_logs_dir / f"{cam_key}.log"
 
 
 def _camera_backend_event(cam_key: str, message: str, *, state: str | None = None, error: str | None = None):
+    """Record one bootstrap event: update the camera's status (state / last
+    error / rolling 20-line history) under the lock and mirror it to the log.
+    """
     ts = datetime.now().isoformat(timespec="seconds")
     event = f"{ts} {message}"
     with camera_backend_state_lock:
@@ -506,6 +653,7 @@ def _camera_backend_event(cam_key: str, message: str, *, state: str | None = Non
 
 
 def _camera_backend_snapshot():
+    """Copy of every camera's bootstrap status dict for /status."""
     with camera_backend_state_lock:
         return {
             cam_key: {
@@ -517,17 +665,24 @@ def _camera_backend_snapshot():
 
 
 def _camera_status_update(cam_key: str, **updates):
+    """Merge fields into one camera's bootstrap status under the state lock."""
     with camera_backend_state_lock:
         status = camera_backend_status[cam_key]
         status.update(updates)
 
 
 def _preview_is_healthy(cam_key: str, max_age_s: float = 5.0) -> bool:
+    """True when the preview loop published a frame within max_age_s.
+
+    This is the single freshness predicate shared by /status and the focus
+    scorer, so both agree on whether a stream is frozen.
+    """
     ts = frame_ts.get(cam_key, 0.0)
     return bool(ts and (time.time() - ts) <= max_age_s)
 
 
 def _camera_health_payload(cam_key: str):
+    """Flatten bootstrap status + preview freshness into the shape the UI polls."""
     with camera_backend_state_lock:
         base = dict(camera_backend_status[cam_key])
     base["preview_healthy"] = _preview_is_healthy(cam_key)
@@ -552,6 +707,15 @@ def _camera_health_payload(cam_key: str):
 
 
 def _build_remote_camera_command(cam_key: str) -> str:
+    """Bash script that (re)starts v4l2rtspserver on the Pi.
+
+    Steps: verify the binary and /dev/video0 exist, TERM then KILL any server
+    already serving this stream name, refuse to start if the RTSP port is
+    still bound, launch under nohup with stdout/err in /tmp/<cam>_...log and
+    the pid in /tmp/<cam>_...pid, then confirm the pid is alive 2 s later.
+    Exit codes: 0 ok, 127 no binary, 66 no /dev/video0, 98 old process
+    would not die, 99 port busy, 1 process died at start (log tail printed).
+    """
     cfg = CAMERA_BOOTSTRAP[cam_key]
     stream_name = cfg["command"][cfg["command"].index("-u") + 1]
     port = cfg["command"][cfg["command"].index("-P") + 1]
@@ -598,6 +762,10 @@ def _build_remote_camera_command(cam_key: str) -> str:
 
 
 def _build_remote_camera_status_command(cam_key: str) -> str:
+    """Bash health probe run on every healthcheck tick: exit 0 while the server
+    process is alive, 66 if /dev/video0 vanished, 1 if it stopped (prints the
+    remote log tail so the failure reason lands in the transcript).
+    """
     cfg = CAMERA_BOOTSTRAP[cam_key]
     stream_name = cfg["command"][cfg["command"].index("-u") + 1]
     remote_log = f"/tmp/{cam_key}_v4l2rtspserver.log"
@@ -615,6 +783,9 @@ def _build_remote_camera_status_command(cam_key: str) -> str:
 
 
 def _build_remote_camera_stop_command(cam_key: str) -> str:
+    """Bash script that stops the remote server (pid file, then pkill TERM ->
+    KILL) and verifies nothing matching is running or listening on the port.
+    """
     cfg = CAMERA_BOOTSTRAP[cam_key]
     stream_name = cfg["command"][cfg["command"].index("-u") + 1]
     remote_pid = f"/tmp/{cam_key}_v4l2rtspserver.pid"
@@ -651,12 +822,18 @@ def _build_remote_camera_stop_command(cam_key: str) -> str:
 
 
 def _build_camera_ssh_command(cam_key: str) -> list[str]:
+    """Human-readable ssh argv written to the transcript. The real invocation is
+    _run_remote_camera_command(), which also applies CAMERA_SSH_OPTS.
+    """
     cfg = CAMERA_BOOTSTRAP[cam_key]
     target = f"{CAMERA_SSH_USER}@{cfg['host']}"
     return ["ssh", target, "bash", "-s"]
 
 
 def _camera_log_line(cam_key: str, line: str):
+    """Feed one line of remote output into the event log; error-looking lines
+    also flip the camera into the 'error' state.
+    """
     if not line:
         return
     if _camera_line_is_error(line):
@@ -666,6 +843,13 @@ def _camera_log_line(cam_key: str, line: str):
 
 
 def _run_remote_camera_command(cam_key: str, command: str, timeout: float = 20):
+    """Run a bash script on the camera Pi over SSH (script passed on stdin to
+    'bash -s').
+
+    Returns (returncode, stdout, stderr). A return code of 255 means ssh
+    itself failed (unreachable host, auth, host-key mismatch) rather than the
+    script. Raises subprocess.TimeoutExpired after `timeout` seconds.
+    """
     cfg = CAMERA_BOOTSTRAP[cam_key]
     target = f"{CAMERA_SSH_USER}@{cfg['host']}"
     ssh_cmd = ["ssh"] + CAMERA_SSH_OPTS + [
@@ -685,10 +869,18 @@ def _run_remote_camera_command(cam_key: str, command: str, timeout: float = 20):
 
 
 def _lens_pins(cam_key) -> dict:
+    """BCM pin map for a camera's focus stepper (per-camera override or default)."""
     return LENS_MOTOR_PIN_OVERRIDES.get(cam_key, LENS_MOTOR_DEFAULT_PINS)
 
 
 def _build_lens_move_script(cam_key, steps, forward) -> str:
+    """Python program executed ON THE PI to pulse the focus stepper driver.
+
+    Uses lgpio: enable the driver (EN low), set DIR, then toggle STEP `steps`
+    times with LENS_STEP_DELAY per half pulse, and always release EN. Prints
+    'lens-ok' on success so the caller can tell a clean run from a partial
+    one whose exit code happens to be 0.
+    """
     pins = _lens_pins(cam_key)
     return f"""python3 - <<'LENSPY'
 import sys, time
@@ -722,6 +914,13 @@ LENSPY
 
 
 def lens_move(cam_key, steps, forward) -> tuple[dict, int]:
+    """Move a camera's focus motor by `steps` microsteps (forward = 'in').
+
+    Position is tracked in software only (lens_position, zeroed by
+    /lens/<cam>/reset) and clamped to +/- LENS_TRAVEL_LIMIT. One move per
+    camera at a time (lens_locks); a second request while busy gets 409.
+    Returns (json_payload, http_status).
+    """
     if cam_key not in CAMERA_SOURCES:
         return {"status": "error", "message": "invalid camera"}, 404
 
@@ -776,6 +975,9 @@ def lens_move(cam_key, steps, forward) -> tuple[dict, int]:
 
 
 def _run_remote_camera_ssh_debug(cam_key: str):
+    """ssh -vvv probe used when a bootstrap SSH attempt fails with no output at
+    all, so the handshake is captured in the transcript for diagnosis.
+    """
     cfg = CAMERA_BOOTSTRAP[cam_key]
     target = f"{CAMERA_SSH_USER}@{cfg['host']}"
     ssh_cmd = ["ssh", "-vvv"] + CAMERA_SSH_OPTS + [
@@ -793,6 +995,7 @@ def _run_remote_camera_ssh_debug(cam_key: str):
 
 
 def _camera_line_is_error(line: str) -> bool:
+    """Keyword heuristic that classifies a line of remote output as an error."""
     lower = line.lower()
     keywords = (
         "not found",
@@ -813,6 +1016,7 @@ def _camera_line_is_error(line: str) -> bool:
 
 
 def _camera_connected_from_output(text: str) -> bool:
+    """Heuristic: does the remote output suggest the USB camera is present?"""
     lower = (text or "").lower()
     if not lower:
         return False
@@ -830,6 +1034,16 @@ def _camera_connected_from_output(text: str) -> bool:
 
 
 def _monitor_camera_backend(cam_key: str):
+    """Daemon thread body: supervise one camera's remote RTSP server forever.
+
+    Loop: run the start script -> on success wait 2 s and run the status
+    script -> while healthy, re-run the status script every
+    CAMERA_BOOTSTRAP_HEALTHCHECK_SEC -> on any non-zero exit (or exception)
+    record the failure, sleep CAMERA_BOOTSTRAP_BACKOFF[n] and start over.
+    Every SSH exchange is appended verbatim to the per-camera transcript
+    and summarised into camera_backend_status for /status. Exits when
+    camera_backend_stop_evt is set.
+    """
     backoff_index = 0
     log_path = _camera_backend_log_path(cam_key)
 
@@ -986,6 +1200,7 @@ def _monitor_camera_backend(cam_key: str):
 
 
 def start_camera_bootstrap():
+    """Spawn one monitor thread per camera (idempotent; no-op when disabled)."""
     if not CAMERA_BOOTSTRAP_ENABLED:
         bootstrap_log.info("Disabled by CAMERA_BOOTSTRAP_ENABLED")
         return
@@ -1000,6 +1215,10 @@ def start_camera_bootstrap():
 
 
 def stop_camera_bootstrap():
+    """Shut the supervisor down: signal the monitors and stop every remote
+    server over SSH. Idempotent - registered with atexit and also called
+    from the SIGINT/SIGTERM handler.
+    """
     global camera_backend_shutdown_done
     with camera_backend_shutdown_lock:
         if camera_backend_shutdown_done:
@@ -1049,6 +1268,7 @@ atexit.register(stop_camera_bootstrap)
 
 
 def _handle_shutdown_signal(signum, _frame):
+    """Stop the remote RTSP servers before exiting on Ctrl-C / systemd stop."""
     stop_camera_bootstrap()
     raise SystemExit(128 + signum)
 
@@ -1059,6 +1279,7 @@ signal.signal(signal.SIGTERM, _handle_shutdown_signal)
 
 # ==================== Camera Helpers ====================
 def current_preview_fps():
+    """Preview frame rate: throttled while a take is being recorded."""
     return float(
         RECORDING_PREVIEW_FPS
         if (STREAM_THROTTLE_ON_RECORD and is_recording_evt.is_set())
@@ -1067,6 +1288,7 @@ def current_preview_fps():
 
 
 def current_jpeg_quality():
+    """Preview JPEG quality: reduced while a take is being recorded."""
     return int(
         RECORDING_JPEG_QUALITY
         if (STREAM_THROTTLE_ON_RECORD and is_recording_evt.is_set())
@@ -1075,11 +1297,13 @@ def current_jpeg_quality():
 
 
 def _assert_ffmpeg_available():
+    """Raise a clear RuntimeError if ffmpeg is not on PATH."""
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg not found in PATH. Install it and try again.")
 
 
 def _ffmpeg_has_encoder(name: str) -> bool:
+    """Is `name` listed by `ffmpeg -encoders` (compile-time support only)?"""
     try:
         out = subprocess.run(
             ["ffmpeg", "-hide_banner", "-encoders"],
@@ -1093,6 +1317,7 @@ def _ffmpeg_has_encoder(name: str) -> bool:
 
 
 def _ffmpeg_has_decoder(name: str) -> bool:
+    """Is `name` listed by `ffmpeg -decoders` (compile-time support only)?"""
     try:
         out = subprocess.run(
             ["ffmpeg", "-hide_banner", "-decoders"],
@@ -1109,6 +1334,12 @@ _cuda_available_cache = None
 
 
 def _ffmpeg_has_usable_cuda() -> bool:
+    """Probe once whether ffmpeg can actually initialise a CUDA device.
+
+    Compile-time NVENC/CUVID support is not enough - a rig without a driver
+    or GPU still lists them - so a tiny lavfi encode is run against
+    cuda:0. The answer is cached for the life of the process.
+    """
     global _cuda_available_cache
     if _cuda_available_cache is not None:
         return _cuda_available_cache
@@ -1149,12 +1380,16 @@ def _ffmpeg_has_usable_cuda() -> bool:
 
 
 def _record_cuda_enabled() -> bool:
+    """CUDA path for recording: forced by FORCE_CUDA_RECORD, else probed."""
     if FORCE_CUDA_RECORD:
         return True
     return _ffmpeg_has_usable_cuda()
 
 
 def best_record_decode_args() -> list:
+    """Hardware MJPEG decode (mjpeg_cuvid) when CUDA is usable, else let ffmpeg
+    choose the software decoder.
+    """
     sys_name = platform.system().lower()
     if (
         sys_name in ("linux", "windows")
@@ -1166,6 +1401,11 @@ def best_record_decode_args() -> list:
 
 
 def best_record_encoder_args():
+    """Encoder args for the LIVE recording: NVENC when usable, else libx264.
+
+    Both variants disable B-frames so every frame is independently seekable
+    and the constant-frame-rate filter chain stays monotonic.
+    """
     sys_name = platform.system().lower()
     # No +faststart on the LIVE recording: it adds a second pass at stop that
     # rewrites the entire file to front-load the moov atom, and a SIGKILL
@@ -1237,11 +1477,17 @@ def best_sync_encoder_args():
     return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"] + common_out
 
 
+# FFmpeg prints 'start: <seconds>' in its input stream dump. Because the
+# recorders run with -use_wallclock_as_timestamps 1, that number is the Unix
+# epoch at which the first frame arrived - it is the ONLY timing reference
+# run_sync_on_dir() has to align the three cameras with each other and with
+# the (host-clock stamped) insole / heart-rate samples.
 START_REGEX = re.compile(r"start:\s*([0-9]+\.[0-9]+)")
 CAMERA_NAME_MAPPING = {"cam1": "side", "cam2": "front", "cam3": "back"}
 
 
 def _read_start_time_from_log(log_path: Path):
+    """First 'start: <epoch>' value found in a per-camera ffmpeg log, or None."""
     if not log_path.exists():
         return None
     try:
@@ -1256,6 +1502,7 @@ def _read_start_time_from_log(log_path: Path):
 
 
 def _ffprobe_json(args: list) -> dict:
+    """Run ffprobe with `args` and parse its JSON output ({} on any failure)."""
     proc = subprocess.run(["ffprobe", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if proc.returncode != 0:
         return {}
@@ -1266,6 +1513,10 @@ def _ffprobe_json(args: list) -> dict:
 
 
 def _get_video_meta(video_path: Path):
+    """Return (duration_s, fps) of a video via ffprobe.
+
+    fps prefers r_frame_rate, then avg_frame_rate, then TARGET_FPS_WRITE.
+    """
     data = _ffprobe_json(
         [
             "-v",
@@ -1316,6 +1567,15 @@ def _parse_sensor_timestamp(value):
 
 
 def _sync_ble_file(recording_dir: Path, sync_start: float, sync_end: float):
+    """Window the decoded insole log to the synced video interval.
+
+    Reads the newest ble/insole_log_recording_*.json, keeps only samples
+    whose host timestamp falls in [sync_start, sync_end], adds Timestamp_UTC
+    and video_time_s (seconds since the synced video's frame zero) and
+    writes sync/ble_sync.json. Returns a stats dict (counts per side,
+    dropped samples, >100 ms gaps, late start / early end) that ends up in
+    sync_manifest.json and drives validate_recording().
+    """
     ble_dir = recording_dir / "ble"
     candidates = sorted(ble_dir.glob("insole_log_recording_*.json")) if ble_dir.exists() else []
     candidates = [path for path in candidates if not path.name.endswith("_sync.json")]
@@ -1372,6 +1632,10 @@ def _sync_ble_file(recording_dir: Path, sync_start: float, sync_end: float):
 
 
 def _sync_heartbeat_file(recording_dir: Path, sync_start: float, sync_end: float):
+    """Same as _sync_ble_file() for the heart-rate JSONL: window the newest
+    heartbeat/heart_rate_recording_*.jsonl to the video interval, add
+    timestamp_utc / video_time_s and write sync/heart_rate_sync.jsonl.
+    """
     heartbeat_dir = recording_dir / "heartbeat"
     candidates = sorted(heartbeat_dir.glob("heart_rate_recording_*.jsonl")) if heartbeat_dir.exists() else []
     if not candidates:
@@ -1428,6 +1692,24 @@ def _sync_heartbeat_file(recording_dir: Path, sync_start: float, sync_end: float
 
 
 def run_sync_on_dir(recording_dir: Path):
+    """Align the raw per-camera recordings into a common time window.
+
+    Algorithm:
+      1. For each cam with both <cam>.mp4 and a 'start:' epoch in <cam>.log,
+         note its wall-clock start.
+      2. sync_start = the LATEST start; each camera is trimmed by
+         (sync_start - its own start) so frame zero is simultaneous.
+      3. common duration = shortest remaining video; common fps = median of
+         the cameras' fps. Every camera is re-encoded in parallel to
+         sync/<cam>_sync_<view>.mp4 with fps=<common>,setpts=PTS-STARTPTS
+         (best_sync_encoder_args), so all outputs have identical frame
+         counts - validate_recording() checks exactly that.
+      4. Insole and heart-rate logs are windowed to [sync_start, sync_end]
+         (see _sync_ble_file / _sync_heartbeat_file).
+    With a single camera the raw file is copied instead of re-encoded.
+    Everything is summarised in sync/sync_manifest.json (also returned);
+    ok requires >= 2 successfully re-encoded cameras.
+    """
     sync_dir = recording_dir / "sync"
     sync_dir.mkdir(exist_ok=True)
     available = {}
@@ -1614,6 +1896,9 @@ def run_sync_on_dir(recording_dir: Path):
 
 
 def _open_cv_rtsp(source_url: str):
+    """cv2 capture over the FFmpeg backend with a 1-frame buffer, so the
+    preview shows the newest frame instead of draining a queue.
+    """
     cap = cv2.VideoCapture(source_url, cv2.CAP_FFMPEG)
     try:
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -1623,6 +1908,14 @@ def _open_cv_rtsp(source_url: str):
 
 
 def capture_frames(cam_key, source_url: str):
+    """Preview thread body (one per camera).
+
+    Keeps an RTSP capture open, resizes each frame to FRAME_SIZE and
+    publishes it into frames[cam_key] / frame_ts[cam_key]. Reconnects with
+    RTSP_RETRY_BACKOFF when the stream cannot be opened or goes silent for
+    RTSP_TIMEOUT_MS; reopen_capture_evts forces a reconnect (set after every
+    recording stop, because the remote server is restarted then).
+    """
     backoffs = list(RTSP_RETRY_BACKOFF)
     last_frame_wall = 0.0
 
@@ -1660,12 +1953,17 @@ def capture_frames(cam_key, source_url: str):
 
 
 def start_capture_threads():
+    """Start the per-camera preview threads (called once from __main__)."""
     for cam_key, src in CAMERA_SOURCES.items():
         t = threading.Thread(target=capture_frames, args=(cam_key, src), daemon=True)
         t.start()
 
 
 def gen_frames(cam_key):
+    """Generator behind /video_feed/<cam>: JPEG-encode the latest preview
+    frame at the current fps / quality as a multipart/x-mixed-replace
+    stream. Runs for as long as the browser keeps the connection open.
+    """
     while True:
         fps = current_preview_fps()
         interval = 1.0 / max(1.0, fps)
@@ -1694,6 +1992,7 @@ def gen_frames(cam_key):
 
 
 def latest_frame_copy(cam_key):
+    """Thread-safe copy of the newest preview frame (None if nothing yet)."""
     if cam_key not in CAMERA_SOURCES:
         return None
     with frame_locks[cam_key]:
@@ -1702,6 +2001,12 @@ def latest_frame_copy(cam_key):
 
 
 def focus_payload_for_camera(cam_key, target="cube"):
+    """Score lens focus on a camera's newest preview frame.
+
+    Delegates to codesharpnessmeasure.measure_frame() with the per-camera
+    best-so-far tracker. Returns (payload, http_status): 503 when the
+    scorer is unavailable, there is no frame, or the frame is stale.
+    """
     if cam_key not in CAMERA_SOURCES:
         return {"error": "invalid camera"}, 404
     if not FOCUS_MEASURE_AVAILABLE:
@@ -1738,6 +2043,15 @@ def focus_payload_for_camera(cam_key, target="cube"):
 
 
 def build_ffmpeg_record_cmd(src_url: str, out_path: Path):
+    """argv for one camera's recorder.
+
+    Input: RTSP over TCP with wall-clock timestamps and generous buffers
+    (a 90 fps MJPEG stream bursts). Video filter: settb/fps/setpts force a
+    constant TARGET_FPS_WRITE timeline (frames are duplicated or dropped
+    as needed) and showinfo logs per-frame metadata; the hwdownload step is
+    only present when decoding on the GPU. Output: no audio/subtitles, a
+    90 kHz track timescale so sub-frame timestamps survive the mp4 muxer.
+    """
     fps = int(TARGET_FPS_WRITE)
 
     dec = best_record_decode_args()
@@ -1779,6 +2093,15 @@ def build_ffmpeg_record_cmd(src_url: str, out_path: Path):
 
 
 def start_recording_all():
+    """Spawn one FFmpeg recorder per camera into a fresh recording_N folder.
+
+    Bumps recording_index, sets recording_start_epoch / current_recording_dir
+    and, only once at least one encoder is confirmed alive, is_recording_evt.
+    Raises RuntimeError when ffmpeg is missing, when REQUIRE_CUDA_RECORD is
+    set but CUDA is unusable, or when every encoder dies immediately (any
+    encoders that did start are killed first). Callers hold
+    session_state_lock; start_combined() is the normal entry point.
+    """
     global recording_index, recording_start_epoch, current_recording_dir, record_procs, record_logs
     if is_recording_evt.is_set():
         return
@@ -1866,6 +2189,9 @@ def start_recording_all():
 
 
 def _snap_output_dir() -> Path:
+    """New snaps/snap_<ts>/ folder under the active recording (if any) or the
+    session.
+    """
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     base = current_recording_dir if (is_recording_evt.is_set() and current_recording_dir) else SESSION_DIR
     out = base / "snaps" / f"snap_{ts}"
@@ -1874,6 +2200,9 @@ def _snap_output_dir() -> Path:
 
 
 def _snapshot_via_ffmpeg(src_url: str, out_path: Path) -> bool:
+    """Grab one full-resolution JPEG straight from the RTSP stream (preferred:
+    not subject to the preview resize). False on failure or a tiny file.
+    """
     if not shutil.which("ffmpeg"):
         return False
     cmd = ["ffmpeg", "-y"] + FFMPEG_RTSP_INPUT + [
@@ -1895,6 +2224,7 @@ def _snapshot_via_ffmpeg(src_url: str, out_path: Path) -> bool:
 
 
 def _snapshot_from_preview(cam_key: str, out_path: Path) -> bool:
+    """Fallback snapshot from the last preview frame (already FRAME_SIZE)."""
     with frame_locks[cam_key]:
         frame = frames.get(cam_key)
     if frame is None:
@@ -1904,6 +2234,11 @@ def _snapshot_from_preview(cam_key: str, out_path: Path) -> bool:
 
 
 def capture_photos_all() -> dict:
+    """Snapshot every camera into a fresh snap folder and write manifest.json.
+
+    Backs calibration image capture (/api/calibration/capture), the admin
+    snapshot endpoint (/api/snapshots) and the legacy /capture_photos form.
+    """
     out_dir = _snap_output_dir()
     results = []
     for cam_key, src in CAMERA_SOURCES.items():
@@ -1934,6 +2269,7 @@ def capture_photos_all() -> dict:
 
 
 def _rel(path: Path | None) -> str | None:
+    """Path relative to BASE_DIR as a string (the form the UI/API exchange)."""
     if path is None:
         return None
     try:
@@ -1943,6 +2279,7 @@ def _rel(path: Path | None) -> str | None:
 
 
 def _calibration_required_fields(data: dict) -> tuple[bool, str | None]:
+    """Minimal schema check shared by in-app and uploaded calibration JSON."""
     model = data.get("selected_model") or data.get("model")
     if model not in ("pinhole", "fisheye"):
         return False, "Calibration JSON must include selected_model/model as pinhole or fisheye."
@@ -1956,6 +2293,7 @@ def _calibration_required_fields(data: dict) -> tuple[bool, str | None]:
 
 
 def _load_calibration_json(path: Path | None = None) -> dict | None:
+    """Parsed calibration JSON for the current session if present AND valid."""
     path = path or CALIBRATION_JSON
     if not path.exists():
         return None
@@ -1968,22 +2306,27 @@ def _load_calibration_json(path: Path | None = None) -> dict | None:
 
 
 def calibration_available() -> bool:
+    """Does the current session hold a valid cam1 calibration?"""
     return _load_calibration_json() is not None
 
 
 def sport_selected() -> bool:
+    """Has the operator chosen a sport for this process yet?"""
     return selected_sport in SPORT_OPTIONS
 
 
 def current_sport() -> str:
+    """Selected sport, or DEFAULT_SPORT before one is chosen."""
     return selected_sport if sport_selected() else DEFAULT_SPORT
 
 
 def current_sport_config() -> dict:
+    """SPORT_OPTIONS entry for the current sport."""
     return SPORT_OPTIONS[current_sport()]
 
 
 def sport_options_for_template() -> list[dict]:
+    """SPORT_OPTIONS as a list for the sport-select page / status payloads."""
     return [
         {"value": value, **config}
         for value, config in SPORT_OPTIONS.items()
@@ -1991,6 +2334,9 @@ def sport_options_for_template() -> list[dict]:
 
 
 def ui_template_context(page_mode: str) -> dict:
+    """Context for index35_cam_sole.html. The single template renders one of
+    three views selected by page_mode: sport_select, calibration, recording.
+    """
     return {
         "page_mode": page_mode,
         "sport_options": sport_options_for_template(),
@@ -2010,10 +2356,12 @@ def ui_template_context(page_mode: str) -> dict:
 
 
 def calibration_required() -> bool:
+    """Whether the selected sport needs an undistorted cam1 (see SPORT_OPTIONS)."""
     return bool(current_sport_config()["calibration_required"])
 
 
 def _calibration_summary(path: Path | None = None) -> dict:
+    """Compact calibration descriptor embedded in most status payloads."""
     path = path or CALIBRATION_JSON
     data = _load_calibration_json(path)
     if not data:
@@ -2039,6 +2387,10 @@ def _calibration_summary(path: Path | None = None) -> dict:
 
 
 def _snap_rows() -> list[dict]:
+    """One row per calibration snapshot of CALIBRATION_CAMERA, joined with the
+    detector's per-image results (marker / corner counts, 'used' flag) from
+    either the calibration JSON or the detection-only pass.
+    """
     detections_by_image = {}
     detections_path = CALIBRATION_DIR / "detections_cam1.json"
     calibration_data = _load_calibration_json()
@@ -2071,6 +2423,11 @@ def _snap_rows() -> list[dict]:
 
 
 def _calibration_status_payload() -> dict:
+    """Full /api/calibration/status payload: snap rows, usable-image count vs
+    the CALIBRATION_MIN_* thresholds, the calibration summary and an
+    original/undistorted preview pair (generated on the fly for uploaded
+    calibrations whose preview images are not on this machine).
+    """
     snaps = _snap_rows()
     usable = sum(1 for row in snaps if row.get("used") is True)
     calibration_data = _load_calibration_json()
@@ -2139,6 +2496,14 @@ def _calibration_status_payload() -> dict:
 
 
 def _run_session_calibration() -> dict:
+    """Solve cam1 intrinsics from this session's snaps and persist
+    calibration_cam1.json.
+
+    Board geometry is fixed here: ChArUco 4x3 squares, 40 mm squares with
+    30 mm markers, DICT_4X4_50; model 'auto' lets the calibrator pick
+    pinhole vs fisheye. The calibrator raises SystemExit when fewer than
+    CALIBRATION_MIN_IMAGES usable images exist (surfaced as HTTP 400).
+    """
     CALIBRATION_DIR.mkdir(parents=True, exist_ok=True)
     args = argparse.Namespace(
         images=None,
@@ -2166,6 +2531,9 @@ def _run_session_calibration() -> dict:
 
 
 def _run_detection_preview() -> dict | None:
+    """Detection-only pass (no solve) so the UI can show per-snap marker and
+    corner counts right after each capture. None if there are no snaps yet.
+    """
     if len(list((SESSION_DIR / "snaps").glob(f"*/{CALIBRATION_CAMERA}.jpg"))) < 1:
         return None
     CALIBRATION_DIR.mkdir(parents=True, exist_ok=True)
@@ -2194,6 +2562,9 @@ def _run_detection_preview() -> dict | None:
 
 
 def _save_uploaded_calibration_json(data: dict) -> dict:
+    """Persist an operator-supplied calibration JSON as this session's
+    calibration (tagged source=uploaded_json). Raises ValueError if invalid.
+    """
     ok, error = _calibration_required_fields(data)
     if not ok:
         raise ValueError(error or "Invalid calibration JSON.")
@@ -2206,6 +2577,9 @@ def _save_uploaded_calibration_json(data: dict) -> dict:
 
 
 def _candidate_from_calibration(data: dict) -> tuple[CalibrationCandidate, tuple[int, int]]:
+    """Rebuild the calibrator's CalibrationCandidate from stored JSON so that
+    make_maps() can produce undistortion maps. Returns (candidate, (w, h)).
+    """
     image_size = (int(data["image_size"]["width"]), int(data["image_size"]["height"]))
     candidate = CalibrationCandidate(
         model=data.get("selected_model") or data.get("model"),
@@ -2221,6 +2595,13 @@ def _candidate_from_calibration(data: dict) -> tuple[CalibrationCandidate, tuple
 
 
 def _undistort_video_file(src: Path, dst: Path, calibration_data: dict) -> dict:
+    """Undistort a whole video: OpenCV remap frame by frame into an mp4v
+    intermediate, then a final ffmpeg re-encode with best_sync_encoder_args().
+
+    OpenCV's own H.264 writer is unreliable across builds, hence the two
+    stages. Raises RuntimeError if the video size does not match the
+    calibration's image_size or no frame was written.
+    """
     candidate, image_size = _candidate_from_calibration(calibration_data)
     cap = cv2.VideoCapture(str(src))
     if not cap.isOpened():
@@ -2288,6 +2669,14 @@ def _undistort_video_file(src: Path, dst: Path, calibration_data: dict) -> dict:
 
 
 def postprocess_recording_for_upload(recording_dir: Path) -> dict:
+    """Prepare the synced outputs for upload; writes processing_status.json.
+
+    For sports that require calibration, the synced cam1 file is moved to
+    distorted/ and replaced in sync/ by its undistorted version, so the
+    file names the upload / download paths use stay the same. Other sports
+    (or a missing cam1) just record a skip_undistort step. Never raises;
+    failures land in the returned status['errors'].
+    """
     status = {
         "ok": False,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -2592,6 +2981,16 @@ def validate_recording(recording_dir: Path) -> dict:
 
 
 def stop_recording_all(process_outputs: bool = True):
+    """Stop every camera recorder and (optionally) run the post-stop pipeline.
+
+    Clears is_recording_evt first so no route can start a second take,
+    sends SIGINT (graceful mp4 finalisation) to each ffmpeg with a 15 s
+    per-process grace before SIGKILL, closes the logs, then - when
+    process_outputs - runs sync, post-processing and validation. Finally
+    asks the preview threads to reconnect. stop_combined() passes
+    process_outputs=False and runs the pipeline itself after the sensors
+    have stopped.
+    """
     global record_procs, recording_start_epoch, record_logs, current_recording_dir
     if not is_recording_evt.is_set():
         return
@@ -2645,7 +3044,26 @@ def stop_recording_all(process_outputs: bool = True):
 
 
 # ==================== BLE Backend ====================
+# Two classes: InsoleDevice wraps one physical insole (a bleak client plus
+# its sample buffers), BleCoordinator owns the pair, the asyncio loop they
+# run on, side assignment and the per-take logging. Flask handlers only ever
+# talk to the module-level `ble` coordinator; every coroutine is executed on
+# the coordinator's loop thread via BleCoordinator._run().
 class InsoleDevice:
+    """One BLE pressure insole.
+
+    Owns the bleak client, the notify handlers and three copies of the data:
+      * data_buffer  - last 2000 decoded samples for the live UI
+      * _raw_buffer  - every accepted sample for the take, as 28-byte records
+                       (8-byte little-endian double host timestamp + the raw
+                       20-byte packet); decoded by BleCoordinator.stop_logging
+      * WAL file     - the same 28-byte records appended to disk as they
+                       arrive (armed per take), so a crash loses <= ~1 s
+    All buffer access is under _buffer_lock because the notify callbacks
+    run on the BLE asyncio loop thread while Flask threads read/clear.
+    Counters (packet_count, notify_count, crc_errors, ...) are plain ints
+    read without the lock for status only.
+    """
     def __init__(self, address: str, name: str):
         self.address = address
         self.name = name or "Unknown"
@@ -2685,6 +3103,7 @@ class InsoleDevice:
         self.wal_errors = 0
 
     def set_wal(self, path: Path):
+        """Open (or replace) the write-ahead log file for the current take."""
         with self._buffer_lock:
             self._close_wal_locked()
             self._wal_path = path
@@ -2692,6 +3111,7 @@ class InsoleDevice:
             self._wal_last_fsync = time.time()
 
     def _close_wal_locked(self):
+        """Flush + fsync + close the WAL; caller holds _buffer_lock."""
         if self._wal_file:
             try:
                 self._wal_file.flush()
@@ -2705,10 +3125,12 @@ class InsoleDevice:
             self._wal_file = None
 
     def close_wal(self):
+        """Seal the WAL (flush/fsync/close) without deleting it."""
         with self._buffer_lock:
             self._close_wal_locked()
 
     def remove_wal(self):
+        """Close and delete the WAL file (see note below on ordering)."""
         # Call only after the decoded JSON is durably on disk — the WAL is the
         # sole copy of this take's samples until then.
         with self._buffer_lock:
@@ -2721,6 +3143,12 @@ class InsoleDevice:
                 self._wal_path = None
 
     async def connect(self):
+        """Connect, subscribe to status notifications and read device info.
+
+        Retries up to four times with increasing delays but only for BlueZ's
+        transient 'InProgress' errors; any other failure aborts immediately.
+        Returns True on success, False (after logging) on failure.
+        """
         if self.connected and self.client:
             return True
         retries = [0.0, 0.8, 1.5, 2.5]
@@ -2752,10 +3180,12 @@ class InsoleDevice:
         return False
 
     def _on_disconnect(self, client):
+        """bleak callback: mark the device offline so status/logging notice."""
         self.connected = False
         self.is_streaming = False
 
     async def disconnect(self):
+        """Stop streaming (if active) and drop the BLE connection; never raises."""
         if self.client:
             try:
                 if self.is_streaming:
@@ -2769,6 +3199,9 @@ class InsoleDevice:
         self.connected = False
 
     async def read_device_info(self):
+        """Populate model / manufacturer / firmware / hardware from the standard
+        Device Information Service; missing characteristics are ignored.
+        """
         if not self.connected or not self.client:
             return
         for uuid_attr, field in [
@@ -2784,10 +3217,12 @@ class InsoleDevice:
                 pass
 
     async def toggle_led(self):
+        """Blink the insole's LED so the operator can tell Left from Right."""
         if self.connected and self.client:
             await self.client.write_gatt_char(UUID_CMD_CHAR, CMD_LED_TOGGLE, response=False)
 
     async def set_frequency(self, freq_cmd: bytes):
+        """Send a sample-rate command (CMD_FREQ_*) and remember the new code."""
         if self.connected and self.client:
             await self.client.write_gatt_char(UUID_CMD_CHAR, freq_cmd, response=False)
             if freq_cmd == CMD_FREQ_10HZ:
@@ -2798,6 +3233,10 @@ class InsoleDevice:
                 self.frequency_code = 0x0C
 
     async def start_stream(self, freq_cmd: bytes | None = None):
+        """Reset all counters/buffers, optionally push a frequency, and subscribe
+        to ADC notifications. The device starts streaming as soon as the
+        notify is armed.
+        """
         if not self.connected or not self.client:
             return
         self.packet_count = 0
@@ -2824,6 +3263,7 @@ class InsoleDevice:
         self.is_streaming = True
 
     async def wait_for_data(self, timeout_s: float = 1.2, poll_s: float = 0.05) -> bool:
+        """Poll until at least one ADC notification has arrived (True) or timeout."""
         end = time.time() + max(0.1, timeout_s)
         while time.time() < end:
             if self.notify_count > 0 or self.packet_count > 0:
@@ -2854,6 +3294,7 @@ class InsoleDevice:
         self.is_streaming = True
 
     async def stop_stream(self):
+        """Unsubscribe from ADC notifications; the device stops sending."""
         if not self.connected or not self.client:
             return
         try:
@@ -2863,12 +3304,14 @@ class InsoleDevice:
         self.is_streaming = False
 
     def get_raw_data_and_clear(self):
+        """Destructive read of the take buffer (used to discard pre-roll samples)."""
         with self._buffer_lock:
             out = bytes(self._raw_buffer)
             self._raw_buffer = bytearray()
         return out
 
     def get_raw_data(self):
+        """Non-destructive copy of the take buffer (used to decode at stop)."""
         # Non-destructive read: stop_logging() decodes from this and clears
         # only AFTER the JSON is durably written. The old clear-then-serialize
         # order destroyed the RAM copy before anything reached disk, so any
@@ -2878,10 +3321,14 @@ class InsoleDevice:
             return bytes(self._raw_buffer)
 
     def clear_raw_data(self):
+        """Drop the take buffer - only after its contents are durably on disk."""
         with self._buffer_lock:
             self._raw_buffer = bytearray()
 
     def _handle_status(self, sender, data):
+        """STATUS_CHAR notify: [charging u8][streaming u8][battery mV u16 LE]
+        [frequency code u8] ...
+        """
         if len(data) < 8:
             return
         self.is_charging = bool(data[0])
@@ -2890,6 +3337,17 @@ class InsoleDevice:
         self.frequency_code = data[4]
 
     def _handle_adc_data(self, sender, data):
+        """ADC_CHAR notify: N back-to-back 20-byte packets (typically
+        SAMPLES_PER_NOTIFY).
+
+        Packet layout (little-endian): [device ms u16][8 x channel u16]
+        [CRC-16 u16 over the first 18 bytes]. Packets failing the CRC are
+        counted and dropped. Each accepted packet is stamped with the host
+        clock (the value later aligned to video via video_time_s), appended
+        to the live ring, the take buffer and the WAL. Runs on the BLE loop
+        thread at up to 200 Hz / SAMPLES_PER_NOTIFY notifies per second, so
+        it must stay cheap.
+        """
         if len(data) < SINGLE_SAMPLE_SIZE or len(data) % SINGLE_SAMPLE_SIZE != 0:
             return
 
@@ -2942,6 +3400,22 @@ class InsoleDevice:
 
 
 class BleCoordinator:
+    """Owns the insole pair and everything Flask needs to drive it.
+
+    Responsibilities: device pool + BLE scan, Left/Right assignment,
+    connect/stream/frequency control, per-take logging (WAL + JSON dump)
+    and the status snapshot. Runs a private asyncio loop on a daemon thread;
+    public methods are synchronous wrappers that submit the matching
+    coroutine with _run() and block with a timeout. _lock guards the pool
+    and assignment fields against concurrent Flask threads; the loop thread
+    itself is single-threaded so coroutines do not take it.
+
+    Lifecycle per take: start_logging(rec_dir, idx) freezes the assignment
+    map, discards pre-roll samples and arms the WALs; stop_logging() seals
+    the WALs, decodes the buffers into ble/insole_log_recording_<idx>.json
+    (atomic write), and only then clears buffers and deletes the WALs.
+    recover_ble_wals() replays any WAL left behind by a crash at startup.
+    """
     def __init__(self, session_dir: Path):
         self.session_dir = session_dir
         self.devices = {}  # address -> InsoleDevice
@@ -2962,17 +3436,23 @@ class BleCoordinator:
         self._thread.start()
 
     def _run_loop(self):
+        """Thread body: run the private asyncio loop forever."""
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
     def _run(self, coro, timeout=30):
+        """Execute `coro` on the BLE loop from a Flask thread and wait for it.
+        Raises concurrent.futures.TimeoutError after `timeout` seconds.
+        """
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return fut.result(timeout=timeout)
 
     def _device(self, address: str):
+        """InsoleDevice for a MAC address, or None."""
         return self.devices.get(address)
 
     def _active_stream_count(self) -> int:
+        """Number of connected devices that have delivered at least one packet."""
         # Count only devices that have actually delivered stream data in this session.
         return sum(
             1
@@ -2981,6 +3461,7 @@ class BleCoordinator:
         )
 
     def _stream_targets(self):
+        """Connected devices to (re)arm, Left then Right first, then any others."""
         targets = []
         seen = set()
         for addr in [self.left_address, self.right_address]:
@@ -2999,6 +3480,7 @@ class BleCoordinator:
         return targets
 
     async def _scan(self):
+        """5 s BLE discovery; returns [{name, address, rssi}, ...]."""
         result = []
         devices = await BleakScanner.discover(timeout=5.0)
         for d in devices:
@@ -3007,12 +3489,14 @@ class BleCoordinator:
         return result
 
     def scan(self):
+        """Blocking BLE scan; caches the result in `discovered` for snapshot()."""
         rows = self._run(self._scan(), timeout=20)
         with self._lock:
             self.discovered = rows
         return rows
 
     def add_device(self, address: str, name: str):
+        """Add an insole to the pool (no connection yet); idempotent per address."""
         with self._lock:
             if address in self.devices:
                 return self.devices[address]
@@ -3021,6 +3505,7 @@ class BleCoordinator:
             return dev
 
     def remove_device(self, address: str):
+        """Disconnect and drop a device, clearing any side it was assigned to."""
         dev = self._device(address)
         if not dev:
             return
@@ -3036,6 +3521,9 @@ class BleCoordinator:
                 self.right_address = None
 
     def assign_side(self, address: str, side: str):
+        """Assign a pooled device to 'Left' or 'Right', evicting whatever was
+        there before. Raises ValueError for unknown device / bad side.
+        """
         side = side.title()
         if side not in ("Left", "Right"):
             raise ValueError("side must be Left or Right")
@@ -3067,6 +3555,11 @@ class BleCoordinator:
             dev.side = side
 
     def validate_assignments(self):
+        """Enforce the recording precondition: exactly two connected insoles,
+        one assigned Left and one Right, no extras. Returns
+        {'Left': addr, 'Right': addr} or raises ValueError listing every
+        problem (the message is shown verbatim to the operator).
+        """
         with self._lock:
             connected = [d for d in self.devices.values() if d.connected]
             errors = []
@@ -3094,6 +3587,10 @@ class BleCoordinator:
             return {"Left": self.left_address, "Right": self.right_address}
 
     async def _connect_all(self):
+        """Connect pooled devices one at a time with a 1 s settle between them
+        (parallel connects make the adapter flaky). Never raises; per-device
+        outcomes are in the returned results list.
+        """
         # Match app14: connect one-by-one and let the adapter settle between devices.
         results = []
         devices = list(self.devices.values())
@@ -3120,20 +3617,24 @@ class BleCoordinator:
         }
 
     def connect_all(self):
+        """Blocking wrapper for _connect_all()."""
         return self._run(self._connect_all(), timeout=45)
 
     async def _disconnect_all(self):
+        """Disconnect every pooled device concurrently, ignoring errors."""
         tasks = [d.disconnect() for d in self.devices.values()]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     def disconnect_all(self):
+        """Blocking wrapper for _disconnect_all(); always clears `streaming`."""
         try:
             self._run(self._disconnect_all(), timeout=30)
         finally:
             self.streaming = False
 
     async def _toggle_led(self, address: str):
+        """Blink one device's LED; ValueError if unknown / not connected."""
         d = self._device(address)
         if not d:
             raise ValueError("device not found")
@@ -3142,20 +3643,32 @@ class BleCoordinator:
         await d.toggle_led()
 
     def toggle_led(self, address: str):
+        """Blocking wrapper for _toggle_led()."""
         self._run(self._toggle_led(address), timeout=10)
 
     async def _set_frequency(self, cmd: bytes):
+        """Push a frequency command to every connected device concurrently."""
         tasks = [d.set_frequency(cmd) for d in self.devices.values() if d.connected]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     def set_frequency(self, label: str):
+        """Set the target sample rate ('10Hz' | '100Hz' | '200Hz') for all
+        devices and remember it for later stream (re)arms.
+        """
         cmd = FREQ_MAP.get(label, CMD_FREQ_200HZ)
         self.target_frequency_label = label
         self.target_frequency_cmd = cmd
         self._run(self._set_frequency(cmd), timeout=15)
 
     async def _start_stream(self):
+        """Arm streaming on every connected device and confirm data flows.
+
+        Push the target frequency, arm ADC notifications on all targets as
+        close together as possible, wait 1 s, re-arm any device that stayed
+        silent (force_stream_rearm), wait again, then report which devices
+        delivered packets ('started') and which did not ('skipped').
+        """
         started = []
         already = []
         skipped = []
@@ -3194,6 +3707,7 @@ class BleCoordinator:
         return {"started": started, "already_streaming": already, "skipped": skipped}
 
     async def _measure_device_rates(self, duration_s: float = 2.0, poll_s: float = 0.05):
+        """Sample packet_count over `duration_s` and return per-device Hz."""
         targets = self._stream_targets()
         start_counts = {d.address: int(d.packet_count or 0) for d in targets}
         start_t = time.time()
@@ -3210,6 +3724,7 @@ class BleCoordinator:
         return rates
 
     def _expected_hz(self) -> float:
+        """Nominal sample rate implied by the current target frequency command."""
         if self.target_frequency_cmd == CMD_FREQ_10HZ:
             return 10.0
         if self.target_frequency_cmd == CMD_FREQ_100HZ:
@@ -3217,6 +3732,9 @@ class BleCoordinator:
         return 200.0
 
     async def _validate_stream_rates(self, duration_s: float = 2.0, retries: int = 1):
+        """Check every streaming device delivers >= 85% of the expected rate;
+        re-arm slow devices and retry up to `retries` times.
+        """
         expected = self._expected_hz()
         min_hz = expected * 0.85
 
@@ -3238,6 +3756,7 @@ class BleCoordinator:
         return {"ok": False, "expected_hz": expected, "min_hz": min_hz, "rates": [], "low": [], "attempts": retries + 1}
 
     async def _wait_for_any_packets(self, timeout_s: float = 2.5, poll_s: float = 0.05) -> bool:
+        """True as soon as any connected device has received a packet."""
         end = time.time() + max(0.2, timeout_s)
         while time.time() < end:
             for d in self.devices.values():
@@ -3247,6 +3766,10 @@ class BleCoordinator:
         return False
 
     def start_streaming(self):
+        """Validate assignments, arm streaming and require at least one device
+        to actually deliver data; raises ValueError otherwise. Called both
+        from the UI (/api/ble/start_stream) and by start_combined().
+        """
         self.validate_assignments()
         if self.streaming:
             # Recover from stale state after disconnect/reconnect cycles.
@@ -3263,18 +3786,22 @@ class BleCoordinator:
         return detail
 
     def wait_for_any_packets(self, timeout_s: float = 2.5) -> bool:
+        """Blocking wrapper for _wait_for_any_packets()."""
         return bool(self._run(self._wait_for_any_packets(timeout_s=timeout_s), timeout=max(5, int(timeout_s) + 3)))
 
     def validate_stream_rates(self, duration_s: float = 2.0, retries: int = 1):
+        """Blocking wrapper for _validate_stream_rates()."""
         timeout = max(10, int(duration_s * (retries + 1)) + 8)
         return self._run(self._validate_stream_rates(duration_s=duration_s, retries=retries), timeout=timeout)
 
     async def _stop_stream(self):
+        """Unsubscribe ADC notifications on every streaming device."""
         tasks = [d.stop_stream() for d in self.devices.values() if d.connected and d.is_streaming]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     def stop_streaming(self):
+        """Stop all streams (no-op when not streaming); always clears `streaming`."""
         if not self.streaming:
             return
         try:
@@ -3283,6 +3810,11 @@ class BleCoordinator:
             self.streaming = False
 
     def start_logging(self, rec_dir: Path, rec_idx: int):
+        """Open the recording window for a take: freeze the L/R map, discard
+        pre-roll samples, persist the assignment map and arm one WAL per
+        device under rec_dir/ble/. Raises ValueError (via
+        validate_assignments) if the pair is not ready.
+        """
         # Freeze the mapping for this recording. Later UI changes must not
         # relabel data that was captured under the original assignment.
         self.recording_assignments = self.validate_assignments()
@@ -3324,6 +3856,14 @@ class BleCoordinator:
             ble_logger.warning("Discarded %d pre-recording samples", discarded_samples)
 
     def stop_logging(self):
+        """Close the recording window and write ble/insole_log_recording_N.json.
+
+        Decodes each device's 28-byte records into rows bucketed by the
+        FROZEN assignment (Left / Right / Unassigned), writes the JSON
+        atomically (tmp + fsync + replace) and only then clears buffers and
+        removes the WALs. Returns a summary dict with ok/path/entry counts;
+        ok=False with a message when nothing was captured.
+        """
         self.logging_active = False
         if not self.current_log_file:
             return {"ok": False, "message": "No target file"}
@@ -3425,6 +3965,9 @@ class BleCoordinator:
         }
 
     def snapshot(self):
+        """Status payload for /api/ble/status and /status: pool, per-device
+        counters and live channel values, assignment, streaming/logging flags.
+        """
         with self._lock:
             discovered = list(self.discovered)
             device_rows = []
@@ -3575,6 +4118,8 @@ def recover_ble_wals(sessions_root: Path) -> int:
     return recovered
 
 
+# ---- Subsystem singletons. Created at import so the routes can reference
+# them directly; start_new_session() retargets their session_dir in place.
 ble = BleCoordinator(SESSION_DIR)
 mic = MicCaptureManager(
     base_dir=BASE_DIR,
@@ -3600,6 +4145,9 @@ DEFAULT_FORGEON_API_URL = "https://api-dev-new.forgelabs.in/dev"
 
 
 def _load_rig_credentials():
+    """Cloud credentials per the resolution order above, or None when the rig
+    is not paired. The returned dict feeds UploadWorker and /api/pairing/status.
+    """
     api = os.environ.get("FORGEON_API_URL", "").strip()
     tok = os.environ.get("FORGEON_DEVICE_TOKEN", "").strip()
     if api and tok:
@@ -3623,12 +4171,24 @@ else:
     logging.getLogger("rig.upload").info(
         "Not paired: no env credentials and no %s — pair via /pair", RIG_DEVICE_FILE.name
     )
+# Heart-rate strap: HeartbeatManager launches and talks to a sidecar process;
+# the sidecar is started in __main__ and stopped at exit.
 heartbeat = HeartbeatManager(base_dir=BASE_DIR, session_dir=SESSION_DIR)
 atexit.register(heartbeat.stop_sidecar)
 
 
 # ==================== Combined Control ====================
 def start_new_session():
+    """Roll over to a fresh sessions/session_<ts>/ folder.
+
+    Refuses (RuntimeError) while a take, insole logging or an HR snippet is
+    active. Reassigns the SESSION_* / CALIBRATION_* globals, resets the
+    recording counter and retargets the BLE / heartbeat managers without
+    disconnecting their devices. A manually started continuous HR session
+    is closed in the old folder and reopened in the new one. Calibration
+    does NOT carry over - a new session needs a new (or re-uploaded)
+    calibration for wide-angle sports.
+    """
     global SESSION_TIMESTAMP, SESSION_DIR, CALIBRATION_DIR, CALIBRATION_JSON, CALIBRATION_NPZ
     global camera_backend_logs_dir, recording_index, recording_start_epoch, current_recording_dir
 
@@ -3686,6 +4246,16 @@ def start_new_session():
 
 
 def start_combined(capture_ble: bool = True):
+    """Start a take across every modality; returns the per-subsystem outcome.
+
+    Preconditions (RuntimeError): a sport is selected and, if it needs it,
+    calibration exists. Insoles are best-effort: if they cannot stream the
+    take proceeds without them and ble['ok'] is False. Mic and HR snippet
+    are started for the upcoming recording_N folder, insole logging is
+    opened, and finally the camera recorders are spawned; if that last step
+    fails everything started here is rolled back and the error re-raised.
+    Caller must hold session_state_lock.
+    """
     if is_recording_evt.is_set():
         return {"ok": False, "message": "Recording already running"}
     if not sport_selected():
@@ -3758,6 +4328,16 @@ def start_combined(capture_ble: bool = True):
 
 
 def stop_combined():
+    """Stop a take across every modality and run the post-stop pipeline.
+
+    Order matters: cameras stop first (fast), then insole stream/log, HR
+    snippet and mic, so sensor data extends past the last video frame.
+    Only then are run_sync_on_dir / postprocess / validate run (slow).
+    Sensor failures are captured into *_error / *_warning fields rather
+    than raised, so a flaky strap never leaves the rig stuck in the
+    recording state. The returned dict is what /api/stop_recording answers
+    with. Caller must hold session_state_lock.
+    """
     if not is_recording_evt.is_set():
         return {"ok": False, "message": "Recording not running"}
 
@@ -3844,9 +4424,16 @@ def stop_combined():
     return out
 
 
+
 # ==================== Routes (UI) ====================
+# Legacy operator UI: these render/redirect the single production template
+# and use form POSTs. The JSON twins under /api/ are what the newer
+# browser-based flow and the admin app call.
 @app.route("/")
 def index():
+    """Landing page: /pair until paired, sport picker until a sport is chosen,
+    then calibration or recording depending on the sport.
+    """
     if not rig_paired():
         return redirect("/pair")
     if not sport_selected():
@@ -3856,6 +4443,7 @@ def index():
 
 @app.route("/select_sport", methods=["POST"])
 def select_sport_route():
+    """Form POST from the sport picker; refused (409) mid-take."""
     global selected_sport
     if is_recording_evt.is_set():
         return "Stop the current recording before switching sport.", 409
@@ -3873,6 +4461,7 @@ def select_sport_route():
 
 @app.route("/calibration")
 def calibration_page():
+    """Calibration view (only reachable for sports that require it)."""
     if not sport_selected():
         return redirect(url_for("index"))
     if not calibration_required():
@@ -3882,6 +4471,7 @@ def calibration_page():
 
 @app.route("/recording")
 def recording_page():
+    """Main recording view; redirects back through the gates it depends on."""
     if not rig_paired():
         return redirect("/pair")
     if not sport_selected():
@@ -3893,6 +4483,7 @@ def recording_page():
 
 @app.route("/video_feed/<cam_key>")
 def video_feed(cam_key):
+    """Live MJPEG preview stream for one camera (see gen_frames)."""
     if cam_key not in CAMERA_SOURCES:
         return "Unknown camera", 404
     return Response(gen_frames(cam_key), mimetype="multipart/x-mixed-replace; boundary=frame")
@@ -3900,6 +4491,7 @@ def video_feed(cam_key):
 
 @app.route("/focus/<cam_key>")
 def focus_check(cam_key):
+    """Focus score for one camera; ?target=cube|board."""
     target = request.args.get("target", "cube").strip().lower()
     payload, status_code = focus_payload_for_camera(cam_key, target)
     return jsonify(payload), status_code
@@ -3907,6 +4499,7 @@ def focus_check(cam_key):
 
 @app.route("/focus/all")
 def focus_all():
+    """Focus scores for every camera; overall status is the worst camera's."""
     target = request.args.get("target", "cube").strip().lower()
     if target not in ("cube", "board"):
         return jsonify({"error": "focus target must be cube or board"}), 400
@@ -3937,6 +4530,7 @@ def focus_reset():
 
 @app.route("/lens/<cam_key>/move", methods=["POST"])
 def lens_move_route(cam_key):
+    """Body {size: 'coarse'|'fine'|'<int>', direction: 'in'|'out'} -> lens_move()."""
     if cam_key not in CAMERA_SOURCES:
         payload, status_code = lens_move(cam_key, 0, False)
         return jsonify(payload), status_code
@@ -3979,6 +4573,7 @@ def lens_move_route(cam_key):
 
 @app.route("/lens/<cam_key>/reset", methods=["POST"])
 def lens_reset_route(cam_key):
+    """Declare the current motor position as zero (no motor movement)."""
     if cam_key not in CAMERA_SOURCES:
         return jsonify({"status": "error", "message": "invalid camera"}), 404
     with lens_locks[cam_key]:
@@ -3989,6 +4584,7 @@ def lens_reset_route(cam_key):
 
 @app.route("/lens/status")
 def lens_status_route():
+    """Software position / busy flag / last error for every camera's lens motor."""
     return jsonify({
         cam_key: {
             "position": lens_position[cam_key],
@@ -4001,6 +4597,7 @@ def lens_status_route():
 
 @app.route("/start_recording", methods=["POST"])
 def start_recording_route():
+    """Legacy form POST: start a take (BLE included) and bounce to the page."""
     if not rig_paired():
         return "This rig is not paired with Forgeon yet - open /pair first.", 403
     try:
@@ -4013,6 +4610,7 @@ def start_recording_route():
 
 @app.route("/stop_recording", methods=["POST"])
 def stop_recording_route():
+    """Legacy form POST: stop the take and bounce to the recording page."""
     try:
         with session_state_lock:
             stop_combined()
@@ -4023,6 +4621,7 @@ def stop_recording_route():
 
 @app.route("/new_session", methods=["POST"])
 def new_session_route():
+    """Legacy form POST twin of /api/new_session."""
     try:
         start_new_session()
     except RuntimeError as exc:
@@ -4035,6 +4634,7 @@ def new_session_route():
 
 @app.route("/capture_photos", methods=["POST"])
 def capture_photos_route():
+    """Legacy form POST: snapshot all cameras (calibration image capture)."""
     try:
         capture_photos_all()
         return redirect(url_for("calibration_page" if calibration_required() else "recording_page"))
@@ -4044,6 +4644,7 @@ def capture_photos_route():
 
 @app.route("/media/<path:filepath>", methods=["GET"])
 def media_file(filepath):
+    """Serve any file under BASE_DIR inline (previews, snaps, synced videos)."""
     try:
         # is_relative_to, not startswith: a bare string-prefix check admits
         # sibling paths that share the directory-name prefix (e.g.
@@ -4062,6 +4663,9 @@ def media_file(filepath):
 
 @app.route("/status")
 def status():
+    """The big status payload the UI polls: recording flags, sport, calibration,
+    camera bootstrap health, insole / mic / heartbeat snapshots.
+    """
     camera_status = {cam_key: _camera_health_payload(cam_key) for cam_key in CAMERA_SOURCES}
     return jsonify(
         {
@@ -4092,11 +4696,13 @@ def status():
 
 @app.route("/api/calibration/status", methods=["GET"])
 def api_calibration_status():
+    """Calibration progress (snap rows, usable count, summary, preview pair)."""
     return jsonify(_calibration_status_payload()), 200
 
 
 @app.route("/api/calibration/capture", methods=["POST"])
 def api_calibration_capture():
+    """Snapshot all cameras, run the detection-only pass, return status."""
     try:
         manifest = capture_photos_all()
         detection = _run_detection_preview()
@@ -4125,6 +4731,7 @@ def api_snapshots():
 
 @app.route("/api/calibration/run", methods=["POST"])
 def api_calibration_run():
+    """Solve intrinsics from this session's snaps (400 if too few usable)."""
     try:
         result = _run_session_calibration()
         payload = _calibration_status_payload()
@@ -4138,6 +4745,9 @@ def api_calibration_run():
 
 @app.route("/api/calibration/upload_json", methods=["POST"])
 def api_calibration_upload_json():
+    """Install a calibration JSON: multipart 'file', {path} under BASE_DIR, or
+    the JSON body itself.
+    """
     try:
         if request.files.get("file"):
             data = json.loads(request.files["file"].read().decode("utf-8"))
@@ -4158,9 +4768,13 @@ def api_calibration_upload_json():
         return jsonify({"status": "error", "message": str(e)}), 400
 
 
+
 # ==================== Routes (API Camera+Combined) ====================
 @app.route("/api/start_recording", methods=["POST"])
 def api_start_recording():
+    """Start a take. Distinct statuses for the gates: not_paired (403),
+    sport_required / calibration_required (400), already_recording (200).
+    """
     if not rig_paired():
         return jsonify({
             "status": "not_paired",
@@ -4200,6 +4814,7 @@ def api_start_recording():
 
 @app.route("/api/new_session", methods=["POST"])
 def api_new_session():
+    """Roll over to a new session folder (409 while anything is recording)."""
     try:
         result = start_new_session()
         return jsonify({"status": "success", **result}), 200
@@ -4211,6 +4826,7 @@ def api_new_session():
 
 @app.route("/api/stop_recording", methods=["POST"])
 def api_stop_recording():
+    """Stop the take and return the full stop_combined() report."""
     try:
         with session_state_lock:
             if not is_recording_evt.is_set():
@@ -4229,6 +4845,9 @@ def api_stop_recording():
 
 @app.route("/api/get_recording_files/<int:rec_index>", methods=["GET"])
 def api_get_recording_files(rec_index):
+    """Everything known about one take: synced files, sensor files, sync and
+    validation reports.
+    """
     try:
         rec_dir = SESSION_DIR / f"recording_{rec_index}"
         if not rec_dir.exists():
@@ -4257,6 +4876,7 @@ def api_get_recording_files(rec_index):
 
 @app.route("/api/validate_recording/<int:rec_index>", methods=["POST"])
 def api_validate_recording(rec_index):
+    """Re-run validate_recording() on a finished take."""
     try:
         with session_state_lock:
             if is_recording_evt.is_set() and rec_index == recording_index:
@@ -4272,6 +4892,7 @@ def api_validate_recording(rec_index):
 
 @app.route("/api/list_recordings", methods=["GET"])
 def api_list_recordings():
+    """All takes in the current session with their file / report summaries."""
     try:
         recordings = []
         if SESSION_DIR.exists():
@@ -4311,6 +4932,7 @@ def api_list_recordings():
 
 @app.route("/api/camera/status", methods=["GET"])
 def api_camera_status():
+    """Bootstrap + preview health for every camera."""
     return jsonify(
         {
             "status": "success",
@@ -4322,14 +4944,18 @@ def api_camera_status():
     )
 
 
+
 # ==================== Mic API ====================
+# Thin wrappers over the MicCaptureManager singleton (`mic`).
 @app.route("/api/mic/status", methods=["GET"])
 def api_mic_status():
+    """Mic assignment + remote capture state."""
     return jsonify({"status": "success", **mic.snapshot(include_remote=True)}), 200
 
 
 @app.route("/api/mic/assign", methods=["POST"])
 def api_mic_assign():
+    """Choose which camera Pi hosts the mic ({camera_key} or null to unassign)."""
     data = request.get_json(silent=True) or {}
     camera_key = data.get("camera_key")
     if camera_key is not None:
@@ -4343,6 +4969,7 @@ def api_mic_assign():
 
 @app.route("/api/mic/onset", methods=["GET"])
 def api_mic_onset():
+    """Detected audio onset of the last take (404 if none)."""
     payload = mic.onset()
     status_code = 200 if payload.get("ok") else 404
     return jsonify({"status": "success" if payload.get("ok") else "not_found", **payload}), status_code
@@ -4350,6 +4977,7 @@ def api_mic_onset():
 
 @app.route("/api/mic/waveform", methods=["GET"])
 def api_mic_waveform():
+    """Downsampled waveform of the last take's WAV (404 if none)."""
     try:
         payload = mic.waveform()
         status_code = 200 if payload.get("ok") else 404
@@ -4360,6 +4988,7 @@ def api_mic_waveform():
 
 @app.route("/api/mic/live_waveform", methods=["GET"])
 def api_mic_live_waveform():
+    """Short live waveform from the remote mic for level checks."""
     try:
         payload = mic.live_waveform()
         status_code = 200 if payload.get("ok") else 404
@@ -4368,14 +4997,19 @@ def api_mic_live_waveform():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+
 # ==================== Heartbeat API ====================
+# Thin wrappers over the HeartbeatManager singleton (`heartbeat`). 502 means
+# the sidecar process did not answer.
 @app.route("/api/heartbeat/status", methods=["GET"])
 def api_heartbeat_status():
+    """Sidecar / device / session state."""
     return jsonify({"status": "success", **heartbeat.session_status()}), 200
 
 
 @app.route("/api/heartbeat/service/start", methods=["POST"])
 def api_heartbeat_service_start():
+    """(Re)start the heart-rate sidecar process."""
     try:
         return jsonify({"status": "success", **heartbeat.start_sidecar()}), 200
     except Exception as e:
@@ -4384,6 +5018,7 @@ def api_heartbeat_service_start():
 
 @app.route("/api/heartbeat/hr", methods=["GET"])
 def api_heartbeat_hr():
+    """Latest BPM sample from the sidecar."""
     try:
         return jsonify({"status": "success", **heartbeat.latest()}), 200
     except Exception as e:
@@ -4392,6 +5027,7 @@ def api_heartbeat_hr():
 
 @app.route("/api/heartbeat/device", methods=["GET"])
 def api_heartbeat_device():
+    """Currently connected strap, if any."""
     try:
         return jsonify({"status": "success", **heartbeat.device()}), 200
     except Exception as e:
@@ -4400,6 +5036,7 @@ def api_heartbeat_device():
 
 @app.route("/api/heartbeat/devices", methods=["POST"])
 def api_heartbeat_devices():
+    """Scan for straps (refused mid-take: scanning interrupts notifications)."""
     if is_recording_evt.is_set():
         return jsonify({
             "status": "recording_active",
@@ -4416,6 +5053,7 @@ def api_heartbeat_devices():
 
 @app.route("/api/heartbeat/connect", methods=["POST"])
 def api_heartbeat_connect():
+    """Connect to a strap ({device} address/name, or the sidecar's default)."""
     data = request.get_json(silent=True) or {}
     device = data.get("device")
     if device is not None:
@@ -4429,6 +5067,7 @@ def api_heartbeat_connect():
 
 @app.route("/api/heartbeat/disconnect", methods=["POST"])
 def api_heartbeat_disconnect():
+    """Disconnect the strap."""
     try:
         return jsonify({"status": "success", **heartbeat.disconnect_device()}), 200
     except Exception as e:
@@ -4438,6 +5077,7 @@ def api_heartbeat_disconnect():
 
 @app.route("/api/heartbeat/session/start", methods=["POST"])
 def api_heartbeat_session_start():
+    """Start a continuous session-long HR log (independent of takes)."""
     try:
         return jsonify({"status": "success", **heartbeat.start_session()}), 200
     except Exception as e:
@@ -4446,20 +5086,27 @@ def api_heartbeat_session_start():
 
 @app.route("/api/heartbeat/session/stop", methods=["POST"])
 def api_heartbeat_session_stop():
+    """Stop the continuous HR log."""
     try:
         return jsonify({"status": "success", **heartbeat.stop_session()}), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 400
 
 
+
 # ==================== BLE API ====================
+# Insole control. Several handlers refuse (409 recording_active) while a take
+# is running because they would silently corrupt that take's pressure log -
+# the reasons are spelled out inline where it matters.
 @app.route("/api/ble/status", methods=["GET"])
 def api_ble_status():
+    """BleCoordinator.snapshot()."""
     return jsonify({"status": "success", **ble.snapshot()})
 
 
 @app.route("/api/ble/scan", methods=["POST"])
 def api_ble_scan():
+    """5 s discovery of nearby BLE devices."""
     try:
         rows = ble.scan()
         return jsonify({"status": "success", "count": len(rows), "devices": rows}), 200
@@ -4469,6 +5116,7 @@ def api_ble_scan():
 
 @app.route("/api/ble/add_device", methods=["POST"])
 def api_ble_add_device():
+    """Add {address, name} to the insole pool."""
     data = request.get_json(silent=True) or {}
     address = data.get("address")
     name = data.get("name") or "Unknown"
@@ -4484,6 +5132,7 @@ def api_ble_add_device():
 
 @app.route("/api/ble/remove_device", methods=["POST"])
 def api_ble_remove_device():
+    """Remove a device from the pool (refused mid-take)."""
     # Removing a device mid-take pops it from the coordinator, so stop_logging
     # skips it and that foot's pressure data vanishes with no error.
     if is_recording_evt.is_set():
@@ -4507,6 +5156,7 @@ def api_ble_remove_device():
 
 @app.route("/api/ble/connect_all", methods=["POST"])
 def api_ble_connect_all():
+    """Connect every pooled device; 'partial' when some failed."""
     try:
         detail = ble.connect_all()
         status = "success" if detail.get("connected_all") else "partial"
@@ -4517,6 +5167,7 @@ def api_ble_connect_all():
 
 @app.route("/api/ble/disconnect_all", methods=["POST"])
 def api_ble_disconnect_all():
+    """Disconnect every pooled device."""
     try:
         ble.disconnect_all()
         return jsonify({"status": "success"}), 200
@@ -4526,6 +5177,7 @@ def api_ble_disconnect_all():
 
 @app.route("/api/ble/assign_side", methods=["POST"])
 def api_ble_assign_side():
+    """Assign {address} to {side: Left|Right}."""
     data = request.get_json(silent=True) or {}
     address = data.get("address")
     side = data.get("side")
@@ -4541,6 +5193,7 @@ def api_ble_assign_side():
 
 @app.route("/api/ble/toggle_led", methods=["POST"])
 def api_ble_toggle_led():
+    """Blink one insole's LED to identify it."""
     data = request.get_json(silent=True) or {}
     address = data.get("address")
     if not address:
@@ -4555,6 +5208,7 @@ def api_ble_toggle_led():
 
 @app.route("/api/ble/set_frequency", methods=["POST"])
 def api_ble_set_frequency():
+    """Set the sample rate for all insoles ({frequency: 10Hz|100Hz|200Hz})."""
     data = request.get_json(silent=True) or {}
     freq = data.get("frequency", "200Hz")
     if freq not in FREQ_MAP:
@@ -4569,6 +5223,7 @@ def api_ble_set_frequency():
 
 @app.route("/api/ble/start_stream", methods=["POST"])
 def api_ble_start_stream():
+    """Arm streaming outside of a take (refused mid-take)."""
     # Guard BEFORE any BLE work: re-arming mid-take clears the buffer and
     # recomputes the same deterministic log filename, so the dump at stop
     # would overwrite the take's earlier segment — losing the beginning AND
@@ -4598,6 +5253,7 @@ def api_ble_start_stream():
 
 @app.route("/api/ble/stop_stream", methods=["POST"])
 def api_ble_stop_stream():
+    """Stop streaming and flush any open log (refused mid-take)."""
     # Guard at the top of the handler: stop_streaming() is a no-op when
     # already stopped, so a check placed after it would still let stop_logging
     # truncate a live recording's insole log.
@@ -4616,8 +5272,12 @@ def api_ble_stop_stream():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+
 # ==================== Files ====================
+# Readers for the per-take report files written by the stop pipeline. They
+# never raise: a missing file is {} and a corrupt one is a failed-shaped dict.
 def _get_processing_status(rec_dir: Path) -> dict:
+    """recording_N/processing_status.json (postprocess_recording_for_upload)."""
     status_path = rec_dir / "processing_status.json"
     if not status_path.exists():
         return {}
@@ -4628,6 +5288,7 @@ def _get_processing_status(rec_dir: Path) -> dict:
 
 
 def _get_sync_status(rec_dir: Path) -> dict:
+    """recording_N/sync/sync_manifest.json (run_sync_on_dir)."""
     manifest_path = rec_dir / "sync" / "sync_manifest.json"
     if not manifest_path.exists():
         return {}
@@ -4638,6 +5299,7 @@ def _get_sync_status(rec_dir: Path) -> dict:
 
 
 def _get_validation_report(rec_dir: Path) -> dict:
+    """recording_N/validation_report.json (validate_recording)."""
     report_path = rec_dir / "validation_report.json"
     if not report_path.exists():
         return {}
@@ -4648,6 +5310,9 @@ def _get_validation_report(rec_dir: Path) -> dict:
 
 
 def _get_recording_files_info(rec_dir: Path) -> dict:
+    """Synced camera files keyed by view (side/front/back) with size/mtime -
+    the same set the browser downloads and the uploader sends.
+    """
     files = {}
     for cam_key, semantic_name in CAMERA_NAME_MAPPING.items():
         sync_file = rec_dir / "sync" / f"{cam_key}_sync_{semantic_name}.mp4"
@@ -4665,6 +5330,9 @@ def _get_recording_files_info(rec_dir: Path) -> dict:
 
 
 def _get_ble_logs_info(rec_dir: Path) -> dict:
+    """Insole file(s) for a take: the synced ble_sync.json when sync succeeded,
+    otherwise the raw ble/*.json logs.
+    """
     out = {}
     sync_file = rec_dir / "sync" / "ble_sync.json"
     sync_status = _get_sync_status(rec_dir)
@@ -4703,10 +5371,14 @@ def _get_ble_logs_info(rec_dir: Path) -> dict:
 
 
 def _get_audio_files_info(rec_dir: Path) -> dict:
+    """Mic WAV info for a take (delegated to MicCaptureManager)."""
     return mic.files_info(rec_dir)
 
 
 def _get_heartbeat_files_info(rec_dir: Path) -> dict:
+    """Heart-rate file for a take: synced JSONL when sync succeeded, else the
+    manager's raw listing.
+    """
     sync_file = rec_dir / "sync" / "heart_rate_sync.jsonl"
     sync_status = _get_sync_status(rec_dir)
     sync_failed = bool(sync_status) and (
@@ -4739,8 +5411,12 @@ def rig_paired() -> bool:
     return upload_worker is not None
 
 
+# ---- Pairing (phase-5 enrollment). An admin mints a one-time code in the
+# Forgeon admin UI; the operator types it into /pair on the rig; the rig
+# exchanges it for a device token and stores rig_device.json (mode 0600).
 @app.route("/api/pairing/status", methods=["GET"])
 def api_pairing_status():
+    """Whether the rig is paired, and with which name / API / credential source."""
     return jsonify({
         "paired": upload_worker is not None,
         "name": (_rig_device_info or {}).get("name"),
@@ -4822,6 +5498,8 @@ refresh();
     ), 200
 
 
+# ---- Direct upload. Maps this rig's view names onto the API's manifest
+# fields; 'top' has no camera on this rig but the API accepts it.
 VIEW_FIELD_MAPPING = {"side": "side_view", "front": "front_view", "back": "back_view", "top": "top_view"}
 
 
@@ -4883,6 +5561,7 @@ def api_upload_instance():
 
 @app.route("/api/upload_queue", methods=["GET"])
 def api_upload_queue():
+    """Current upload queue entries (empty + 'unconfigured' when not paired)."""
     if upload_worker is None:
         return jsonify({"status": "unconfigured", "entries": []}), 200
     return jsonify({"status": "success", "entries": upload_worker.snapshot()}), 200
@@ -4890,6 +5569,7 @@ def api_upload_queue():
 
 @app.route("/api/upload_retry", methods=["POST"])
 def api_upload_retry():
+    """Re-queue a failed entry identified by {assessment_id, instance_no}."""
     if upload_worker is None:
         return jsonify({"status": "error", "message": "Direct upload is not configured on this rig."}), 503
     body = request.get_json(silent=True) or {}
@@ -4901,6 +5581,7 @@ def api_upload_retry():
 
 @app.route("/download_file/<path:filepath>", methods=["GET"])
 def download_file(filepath):
+    """Serve any file under BASE_DIR as an attachment (browser download flow)."""
     try:
         # Same fix as /media: prefix-sharing siblings defeat startswith.
         file_path = (BASE_DIR / filepath).resolve()
@@ -4913,6 +5594,10 @@ def download_file(filepath):
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+# Startup order: replay crash WALs into their takes' JSON logs, launch the
+# heart-rate sidecar, start the SSH camera supervisors, start the preview
+# capture threads, then serve. Bootstrap and previews keep retrying in the
+# background, so the UI comes up even when the Pis are still booting.
 if __name__ == "__main__":
     rig_log.info("Session directory: %s", SESSION_DIR)
     try:

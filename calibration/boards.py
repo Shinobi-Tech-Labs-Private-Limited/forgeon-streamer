@@ -23,6 +23,14 @@ from .config import CalibrationConfig
 
 @dataclass(frozen=True)
 class FaceBoard:
+    """One cube face's ChArUco board and the marker IDs it carries.
+
+    ``board`` is an OpenCV CharucoBoard built in millimetres, so every object
+    point it reports is in the board (face-local) frame: origin at the print's
+    top-left, +x print-right, +y print-down, z = 0. ``marker_ids`` is the
+    disjoint ID range allocated to this face, in board order.
+    """
+
     face: str
     board: "cv2.aruco.CharucoBoard"
     marker_ids: tuple[int, ...]
@@ -50,6 +58,9 @@ def build_face_boards(cfg: CalibrationConfig) -> dict[str, FaceBoard]:
     boards: dict[str, FaceBoard] = {}
     for face in cfg.face_order:
         ids = np.asarray(cfg.marker_ids_for_face(face), dtype=np.int32)
+        # ids= replaces OpenCV's default 0..N-1 numbering with this face's own
+        # range; that is the whole mechanism by which one marker identifies a
+        # face. Size is (columns, rows).
         board = cv2.aruco.CharucoBoard(
             (cfg.squares_x, cfg.squares_y),
             cfg.square_length_mm,

@@ -1,5 +1,45 @@
 #!/usr/bin/env python3
 """Calibrate cam intrinsics from ChArUco snaps and undistort images/videos."""
+#
+# Overview
+# --------
+# Role on the rig: intrinsic (lens) calibration for one camera at a time, by
+# default cam1 (CALIBRATION_CAMERA in the app). Two ways in:
+#   * CLI:    python intrinsic_calibrate_charuco.py --snaps-dir sessions/<s>/snaps
+#             --camera cam1 [--undistort-video some.mp4]
+#   * In-app: app35_cam_sole.py builds an argparse.Namespace by hand and calls
+#             calibrate(args) - a full run from its calibration routes, and a
+#             --detect-only run for the snap preview. It also imports
+#             CalibrationCandidate and make_maps to undistort recorded videos
+#             with a previously saved calibration_cam1.json.
+#
+# Pipeline (see calibrate()):
+#   1. collect_image_paths   snaps/<snap_N>/<camera>.jpg (or an --images glob)
+#   2. detect_charuco        ArUco markers -> interpolated ChArUco corners per
+#                            image; annotated copy saved to <out>/detections/
+#   3. calibrate_pinhole /   fit one or both lens models (--model auto = both)
+#      calibrate_fisheye
+#   4. selection             keep numerically valid fits, choose the lower RMS
+#   5. make_maps + undistort every used snap into <out>/undistorted_images/
+#      (+ optional --undistort-image / --undistort-video)
+#   6. write_outputs         calibration_<camera>.json (what the app reads) and
+#                            calibration_<camera>.npz (numpy arrays, all models)
+#
+# Inputs on disk:  snap images of the ChArUco board / calibration cube, all at
+#                  one resolution.
+# Outputs on disk: <output_dir>/calibration_<camera>.{json,npz},
+#                  <output_dir>/detections/*.jpg,
+#                  <output_dir>/undistorted_images/*.jpg,
+#                  <output_dir>/undistorted_videos/*.mp4,
+#                  or just detections_<camera>.json in --detect-only mode.
+#                  output_dir defaults to calibration_<camera>/<session name>.
+#
+# Units: --square-length / --marker-length are metres. They only scale the
+# per-image poses (rvecs/tvecs); the intrinsics and the undistortion maps do
+# not depend on them, but the squares:markers RATIO must match the print.
+#
+# Errors: every hard failure is raised as SystemExit with a message, which is
+# CLI-friendly; in-app callers must catch it (the detect-only preview does).
 
 from __future__ import annotations
 
@@ -20,6 +60,29 @@ DEFAULT_CAMERA = "cam1"
 
 @dataclass
 class CalibrationCandidate:
+    """One fitted lens model for a camera plus everything needed to undistort with it.
+
+    Produced by calibrate_pinhole() / calibrate_fisheye(); consumed by make_maps(),
+    undistort_image() / undistort_video() and write_outputs(). app35_cam_sole.py
+    also rebuilds one from the saved calibration_<camera>.json (with empty
+    rvecs/tvecs) to undistort recorded videos.
+
+    Fields:
+        model: "pinhole" or "fisheye"; decides which cv2 undistortion API applies.
+        rms: reprojection error in pixels reported by the solver. Lower is better;
+            it is the auto-selection criterion.
+        camera_matrix: 3x3 intrinsics K of the raw (distorted) image.
+        dist_coeffs: pinhole -> OpenCV's (k1, k2, p1, p2, k3, ...) in solver order;
+            fisheye -> (k1..k4) as a (4, 1) column. Use .reshape(-1) for a flat list.
+        new_camera_matrix: 3x3 intrinsics of the UNDISTORTED output image (after
+            alpha/balance cropping). Downstream consumers of the undistorted video
+            should use this as K, not camera_matrix.
+        roi: (x, y, w, h) valid-pixel rectangle inside the undistorted image. Only
+            meaningful for pinhole; fisheye reports the full frame.
+        rvecs / tvecs: per-used-image board pose (rotation / translation vectors),
+            in the order the images were fed to the solver. Kept for the .npz only.
+    """
+
     model: str
     rms: float
     camera_matrix: np.ndarray
@@ -31,6 +94,14 @@ class CalibrationCandidate:
 
 
 def make_board(args: argparse.Namespace) -> tuple[Any, Any]:
+    """Build the ArUco dictionary and ChArUco board from the CLI board settings.
+
+    Returns (dictionary, board). The geometry (squares_x by squares_y, square and
+    marker size) must describe the printed board exactly, otherwise detection
+    silently yields few or wrong corners. The defaults (DICT_4X4_50, 4x3,
+    40 mm / 30 mm) are the same values app35_cam_sole.py hard-codes when it
+    calls calibrate().
+    """
     aruco = cv2.aruco
     dictionary = aruco.getPredefinedDictionary(getattr(aruco, args.dictionary))
     board = aruco.CharucoBoard(
@@ -43,6 +114,12 @@ def make_board(args: argparse.Namespace) -> tuple[Any, Any]:
 
 
 def collect_image_paths(args: argparse.Namespace) -> list[Path]:
+    """List the calibration images in a deterministic (sorted) order.
+
+    --images: a glob relative to the CWD. Otherwise <snaps_dir>/*/<camera>.jpg,
+    i.e. one image per snap folder (snap_N/cam1.jpg), which is the layout the
+    app's snap capture writes.
+    """
     if args.images:
         return sorted(Path(".").glob(args.images))
     snaps_dir = Path(args.snaps_dir)
@@ -50,6 +127,12 @@ def collect_image_paths(args: argparse.Namespace) -> list[Path]:
 
 
 def default_output_dir(args: argparse.Namespace) -> Path:
+    """Output folder: --output-dir if given, else calibration_<camera>/<session name>.
+
+    The session name is the parent of the snaps dir when that dir is literally
+    called "snaps" (sessions/session_X/snaps -> calibration_cam1/session_X), so
+    runs on different sessions do not overwrite each other.
+    """
     if args.output_dir:
         return Path(args.output_dir)
     if args.snaps_dir:
@@ -60,6 +143,7 @@ def default_output_dir(args: argparse.Namespace) -> Path:
 
 
 def display_path(path: Path) -> str:
+    """Path relative to the CWD when possible (for JSON and console output), else as given."""
     try:
         return str(path.relative_to(Path.cwd()))
     except ValueError:
@@ -67,6 +151,11 @@ def display_path(path: Path) -> str:
 
 
 def artifact_name(image_path: Path) -> str:
+    """'<snap folder>_<file name>', e.g. snap_3_cam1.jpg.
+
+    Every snap folder holds a same-named cam1.jpg, so per-image outputs need
+    the folder name folded in to stay distinct inside one flat output dir.
+    """
     return f"{image_path.parent.name}_{image_path.name}"
 
 
@@ -76,6 +165,23 @@ def detect_charuco(
     board: Any,
     min_corners: int,
 ) -> tuple[np.ndarray | None, np.ndarray | None, tuple[int, int] | None, np.ndarray | None, int]:
+    """Stage 2: find ChArUco corners in one image.
+
+    Detection is two-step: ArUco markers first, then interpolateCornersCharuco
+    places the chessboard corners between them at sub-pixel precision. Those
+    interpolated corners, not the marker corners, are what the solver fits,
+    which is why a ChArUco board beats a plain ArUco grid for intrinsics.
+
+    Returns (corners, ids, image_size, annotated, marker_count):
+        corners / ids: ChArUco corner pixel positions and their board ids, or
+            None when the image is unreadable or fewer than min_corners corners
+            were found.
+        image_size: (width, height), or None if the image could not be read.
+        annotated: BGR copy with detected markers and corners drawn; calibrate()
+            saves it to <out>/detections/ so a human can see why an image was or
+            was not used. None only for unreadable images.
+        marker_count: raw ArUco markers seen, before corner interpolation.
+    """
     frame = cv2.imread(str(image_path))
     if frame is None:
         return None, None, None, None, 0
@@ -88,6 +194,9 @@ def detect_charuco(
     marker_count = 0 if marker_ids is None else len(marker_ids)
     if marker_count:
         cv2.aruco.drawDetectedMarkers(annotated, marker_corners, marker_ids)
+    # gray.shape is (rows, cols); every OpenCV calibration API wants (width,
+    # height), hence the [::-1]. Two markers is this script's floor before it
+    # asks OpenCV to interpolate corners between them.
     if marker_ids is None or len(marker_ids) < 2:
         return None, None, gray.shape[::-1], annotated, marker_count
 
@@ -109,6 +218,15 @@ def charuco_object_points(
     all_ids: list[np.ndarray],
     all_corners: list[np.ndarray],
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Convert ChArUco detections into the (object_points, image_points) lists
+    that cv2.fisheye.calibrate needs.
+
+    The pinhole path lets calibrateCameraCharuco do this internally; the fisheye
+    API has no ChArUco-aware variant, so each detected corner id is looked up in
+    the board's 3D chessboard corners here. Shapes are (N, 1, 3) / (N, 1, 2)
+    float64 per image because cv2.fisheye.calibrate is strict about exactly
+    that layout and dtype.
+    """
     chessboard_corners = board.getChessboardCorners()
     object_points = []
     image_points = []
@@ -124,6 +242,12 @@ def charuco_object_points(
 
 
 def is_valid_candidate(candidate: CalibrationCandidate) -> bool:
+    """Reject solver output that is numerically garbage.
+
+    OpenCV can hand back NaN/inf matrices or a zero RMS without raising. Such a
+    candidate must never win the auto selection by comparing as a tiny RMS, so
+    it is filtered out before min() runs.
+    """
     arrays = [candidate.camera_matrix, candidate.dist_coeffs, candidate.new_camera_matrix]
     return (
         math.isfinite(candidate.rms)
@@ -139,6 +263,13 @@ def calibrate_pinhole(
     image_size: tuple[int, int],
     alpha: float,
 ) -> CalibrationCandidate:
+    """Stage 3a: fit the standard pinhole + polynomial distortion model.
+
+    cameraMatrix=None / distCoeffs=None let the solver initialise K itself.
+    new_camera_matrix and roi come from getOptimalNewCameraMatrix at the same
+    output size: alpha=0 crops the undistorted image to valid pixels only,
+    alpha=1 keeps the full source field of view with black corners.
+    """
     rms, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.aruco.calibrateCameraCharuco(
         charucoCorners=all_corners,
         charucoIds=all_ids,
@@ -169,15 +300,34 @@ def calibrate_fisheye(
     image_size: tuple[int, int],
     alpha: float,
 ) -> CalibrationCandidate:
+    """Stage 3b: fit the equidistant fisheye model (cv2.fisheye, 4 coefficients).
+
+    Tried alongside pinhole under --model auto in case the lens distortion is
+    stronger than the polynomial pinhole model fits well; the lower RMS wins.
+    `alpha` maps to the fisheye `balance` parameter (0 = crop, 1 = keep FOV),
+    the same meaning as on the pinhole path.
+
+    Raises cv2.error when the input is ill-conditioned (CALIB_CHECK_COND);
+    calibrate() catches that per model and records it under errors["fisheye"].
+    """
     object_points, image_points = charuco_object_points(board, all_ids, all_corners)
     camera_matrix = np.zeros((3, 3), dtype=np.float64)
+    # The fisheye model has exactly four coefficients (k1..k4); both arrays are
+    # zero-initialised because the API fills them in place.
     dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+    # RECOMPUTE_EXTRINSIC: re-solve each view's pose on every iteration instead
+    #   of keeping the initial guess (more accurate; image count is tiny).
+    # CHECK_COND: raise cv2.error on an ill-conditioned system rather than
+    #   return a meaningless fit; calibrate() relies on this to fall back.
+    # FIX_SKEW: pin the skew term at 0; sensors have square, axis-aligned pixels.
     flags = (
         cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC
         | cv2.fisheye.CALIB_CHECK_COND
         | cv2.fisheye.CALIB_FIX_SKEW
     )
     rms, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.fisheye.calibrate(
+        # 200 iterations / 1e-7 eps: a tighter stop than OpenCV's default; the
+        # extra work is negligible for a handful of images.
         object_points,
         image_points,
         image_size,
@@ -194,6 +344,8 @@ def calibrate_fisheye(
         balance=alpha,
         new_size=image_size,
     )
+    # The fisheye API has no ROI concept: `balance` already decided the crop,
+    # so the full frame is reported to keep the dataclass shape uniform.
     roi = (0, 0, image_size[0], image_size[1])
     return CalibrationCandidate(
         model="fisheye",
@@ -208,6 +360,17 @@ def calibrate_fisheye(
 
 
 def make_maps(candidate: CalibrationCandidate, image_size: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
+    """Stage 5: build the remap lookup tables (map1, map2) for cv2.remap.
+
+    Picks the fisheye or pinhole initUndistortRectifyMap by candidate.model. The
+    maps are the expensive part of undistortion; build them once and reuse them
+    for every frame (undistort_video here, and app35_cam_sole.py's own video
+    undistortion). No rectification rotation (identity R / None): this is a
+    single camera, not a stereo pair.
+
+    CV_16SC2 asks for the fixed-point map pair, the fastest layout for
+    cv2.remap and smaller than two float32 maps.
+    """
     if candidate.model == "fisheye":
         return cv2.fisheye.initUndistortRectifyMap(
             candidate.camera_matrix,
@@ -228,6 +391,11 @@ def make_maps(candidate: CalibrationCandidate, image_size: tuple[int, int]) -> t
 
 
 def ensure_matching_size(actual_size: tuple[int, int], expected_size: tuple[int, int], source: Path) -> None:
+    """SystemExit unless the media matches the calibrated resolution.
+
+    Remap tables are resolution-specific; applying them to a differently sized
+    frame would not fail, it would silently produce a wrong image.
+    """
     if actual_size != expected_size:
         raise SystemExit(
             f"Size mismatch for {source}: {actual_size[0]}x{actual_size[1]}, "
@@ -242,6 +410,13 @@ def undistort_image(
     image_size: tuple[int, int],
     output_stem: str | None = None,
 ) -> Path:
+    """Undistort one still with the selected model; save <stem>_undistorted.jpg.
+
+    Returns the written path. output_stem overrides the file stem (calibrate()
+    passes the snap-qualified artifact_name so per-snap outputs do not
+    collide). Rebuilds the remap tables on every call, which is fine for a
+    handful of snaps.
+    """
     frame = cv2.imread(str(image_path))
     if frame is None:
         raise SystemExit(f"Could not read image to undistort: {image_path}")
@@ -263,6 +438,13 @@ def undistort_video(
     candidate: CalibrationCandidate,
     image_size: tuple[int, int],
 ) -> Path:
+    """Undistort every frame of a video into <stem>_<model>_undistorted.mp4.
+
+    Returns the written path. Output uses the mp4v codec at the source fps
+    (30 assumed when the container reports 0). Maps are built once and reused
+    per frame. Raises SystemExit if the video cannot be opened, its size does
+    not match the calibration, or no frame was written.
+    """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise SystemExit(f"Could not open video to undistort: {video_path}")
@@ -302,6 +484,12 @@ def undistort_video(
 
 
 def candidate_to_json(candidate: CalibrationCandidate | None, error: str | None = None) -> dict[str, Any] | None:
+    """JSON-friendly summary of one model's outcome for the "model_results" block.
+
+    None when the model was not attempted, {"error": ...} when its solver
+    raised, otherwise rms + matrices (+ "error" if both a result and an error
+    text exist).
+    """
     if candidate is None:
         if error is None:
             return None
@@ -325,6 +513,15 @@ def write_outputs(
     errors: dict[str, str],
     image_size: tuple[int, int],
 ) -> None:
+    """Stage 6: persist results as calibration_<camera>.json and .npz.
+
+    JSON: the full `result` dict from calibrate(); this is what
+    app35_cam_sole.py reads back and what a human inspects.
+    NPZ: numpy arrays of the SELECTED model under plain names (model,
+    camera_matrix, dist_coeffs, new_camera_matrix, roi, image_size, rvecs,
+    tvecs) plus every attempted model's arrays under a <model>_ prefix and any
+    solver error text as <model>_error.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     with (output_dir / f"calibration_{camera}.json").open("w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
@@ -336,6 +533,8 @@ def write_outputs(
         "new_camera_matrix": selected.new_camera_matrix,
         "roi": np.array(selected.roi),
         "image_size": np.array([image_size[0], image_size[1]]),
+        # object arrays: np.load(...) must be called with allow_pickle=True to
+        # read these two keys back.
         "rvecs": np.array(selected.rvecs, dtype=object),
         "tvecs": np.array(selected.tvecs, dtype=object),
     }
@@ -352,6 +551,38 @@ def write_outputs(
 
 
 def calibrate(args: argparse.Namespace) -> dict[str, Any]:
+    """Run the whole pipeline for one camera and return the result dict.
+
+    `args` is an argparse.Namespace: from parse_args() on the CLI, or built by
+    hand in app35_cam_sole.py (_run_session_calibration and
+    _run_detection_preview), so every attribute read here is part of the
+    contract with the app.
+
+    Stages:
+      1. collect images; SystemExit if none matched.
+      2. detect_charuco on each. Every readable image must share one
+         resolution. An annotated copy is saved to <out>/detections/ for each
+         readable image. SystemExit if fewer than --min-images were usable.
+      3. --detect-only: write detections_<camera>.json and return early (the
+         app uses this to preview snap quality before committing to a run).
+      4. fit pinhole and/or fisheye per --model. A cv2.error from a solver is
+         recorded in `errors`, not fatal, so the other model can still win.
+      5. select: the explicitly requested model (which must be valid), or for
+         auto the valid candidate with the lowest RMS.
+      6. undistort every used snap, plus the optional --undistort-image /
+         --undistort-video.
+      7. write_outputs and return.
+
+    Returns the result dict (also written to calibration_<camera>.json). Key
+    fields: selected_model, rms_reprojection_error_px, camera_matrix,
+    new_camera_matrix, distortion_coefficients (flat list), roi, image_size
+    {width, height}, model_results (per model, see candidate_to_json), board
+    settings, per-image detections (image / used / markers / charuco_corners),
+    and the undistorted output paths. In --detect-only mode only camera,
+    image_size, used_images, total_images and detections are present.
+
+    Raises SystemExit with a message on every hard failure.
+    """
     image_paths = collect_image_paths(args)
     if not image_paths:
         source = args.images if args.images else f"{args.snaps_dir}/*/{args.camera}.jpg"
@@ -442,6 +673,8 @@ def calibrate(args: argparse.Namespace) -> dict[str, Any]:
     valid_candidates = [
         candidate for candidate in candidates.values() if candidate is not None and is_valid_candidate(candidate)
     ]
+    # Explicit --model: that model must have succeeded. auto: lowest RMS wins;
+    # NaN results were already filtered so min() is well defined.
     if args.model != "auto":
         selected = candidates.get(args.model)
         if selected is None or not is_valid_candidate(selected):
@@ -508,6 +741,11 @@ def calibrate(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def parse_args() -> argparse.Namespace:
+    """CLI options. See calibrate() for what each one drives.
+
+    Board defaults must match the physical board; the app passes the same
+    values programmatically instead of going through this parser.
+    """
     parser = argparse.ArgumentParser(
         description="Intrinsic calibration from nested ChArUco snap images."
     )
@@ -536,6 +774,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """CLI entry point: run calibrate() and print a human-readable summary.
+
+    The RMS > 2 px warning is a rule of thumb; a solid ChArUco intrinsic
+    calibration typically lands well under 1 px.
+    """
     args = parse_args()
     result = calibrate(args)
     output_dir = default_output_dir(args)

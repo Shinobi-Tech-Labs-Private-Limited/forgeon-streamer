@@ -45,6 +45,7 @@ from .boards import FaceBoard, build_face_boards, marker_to_face_map
 from .config import CalibrationConfig
 
 FACES = ("FRONT", "RIGHT", "BACK", "LEFT", "TOP", "BOTTOM")
+# Canonical face names (cfg.face_order may list them in a different order).
 
 # face -> (outward normal, print-right direction, print-down direction), cube frame.
 FACE_AXES: dict[str, tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]]] = {
@@ -80,6 +81,8 @@ def face_axes(cfg: CalibrationConfig, face: str) -> tuple[np.ndarray, np.ndarray
     if deg:
         print_right = np.round(_rotate_about_axis(print_right, normal, deg))
         print_down = np.round(_rotate_about_axis(print_down, normal, deg))
+        # Quarter turns of unit axis vectors are exact; round() strips the
+        # cos/sin floating-point noise so the axes stay clean integers.
     return normal, print_right, print_down
 
 
@@ -93,6 +96,7 @@ def T_cube_from_face(cfg: CalibrationConfig, face: str) -> np.ndarray:
     """
     normal, print_right, print_down = face_axes(cfg, face)
     z_board = np.cross(print_right, print_down)  # = -normal by construction
+    # Columns of R are the board's x, y, z axes expressed in the cube frame.
 
     R = np.column_stack([print_right, print_down, z_board])
     board_centre = np.array(
@@ -106,6 +110,8 @@ def T_cube_from_face(cfg: CalibrationConfig, face: str) -> np.ndarray:
         design_right = np.array(FACE_AXES[face][1], dtype=np.float64)
         design_up = -np.array(FACE_AXES[face][2], dtype=np.float64)
         face_centre = face_centre + shift_r * design_right + shift_u * design_up
+    # Choose t so the board centre lands on the (shifted) face centre:
+    # face_centre = R @ board_centre + t.
     t = face_centre - R @ board_centre
 
     T = np.eye(4)
@@ -116,6 +122,7 @@ def T_cube_from_face(cfg: CalibrationConfig, face: str) -> np.ndarray:
 
 def transform_points(T: np.ndarray, points_xyz: np.ndarray) -> np.ndarray:
     """Apply a 4x4 transform to (N, 3) points."""
+    # Row-vector form of P' = R @ P + t for every row of points_xyz.
     pts = np.asarray(points_xyz, dtype=np.float64)
     return pts @ T[:3, :3].T + T[:3, 3]
 
@@ -128,6 +135,11 @@ class CubeModel:
     """
 
     def __init__(self, cfg: CalibrationConfig | None = None):
+        """Build boards, the marker->face map, T_cube_from_face and all 3D corners.
+
+        Args:
+            cfg: configuration to model; defaults to ``CalibrationConfig.load()``.
+        """
         self.cfg = cfg or CalibrationConfig.load()
         self.face_boards: dict[str, FaceBoard] = build_face_boards(self.cfg)
         self.marker_to_face: dict[int, str] = marker_to_face_map(self.cfg)
@@ -157,9 +169,11 @@ class CubeModel:
         return self.chessboard_corners_cube[face][local_corner_id]
 
     def face_of_marker(self, marker_id: int) -> str | None:
+        """Face carrying ArUco ``marker_id``, or None if the ID is not on the cube."""
         return self.marker_to_face.get(int(marker_id))
 
     def outward_normal(self, face: str) -> np.ndarray:
+        """Unit outward normal of ``face`` in the cube frame (design; rotation-independent)."""
         return np.array(FACE_AXES[face][0], dtype=np.float64)
 
     # ---- export ------------------------------------------------------------

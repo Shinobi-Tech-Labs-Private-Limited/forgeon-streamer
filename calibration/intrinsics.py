@@ -34,6 +34,12 @@ INTRINSICS_FIRST_ID = 100
 
 
 def intrinsics_board(cfg: CalibrationConfig) -> "cv2.aruco.CharucoBoard":
+    """The flat 8x6 ChArUco board used for intrinsic calibration, in mm.
+
+    Shares the cube's dictionary but starts its marker IDs at
+    INTRINSICS_FIRST_ID so a stray cube face in a shot can never be mistaken
+    for the board. Raises ValueError if the ranges would collide or overflow.
+    """
     n_markers = (INTRINSICS_BOARD_SQUARES[0] * INTRINSICS_BOARD_SQUARES[1]) // 2
     ids = np.arange(INTRINSICS_FIRST_ID, INTRINSICS_FIRST_ID + n_markers, dtype=np.int32)
     cube_max = max(i for f in cfg.face_order for i in cfg.marker_ids_for_face(f))
@@ -49,6 +55,14 @@ def intrinsics_board(cfg: CalibrationConfig) -> "cv2.aruco.CharucoBoard":
 
 @dataclass
 class IntrinsicsResult:
+    """Output of an intrinsic calibration run.
+
+    ``camera_matrix`` is the 3x3 K (fx, fy, cx, cy in pixels);
+    ``dist_coeffs`` is OpenCV's 5-term vector (k1, k2, p1, p2, k3);
+    ``image_size`` is (width, height) in pixels and is the resolution the
+    intrinsics are valid for. ``rms_px`` is OpenCV's overall reprojection RMS.
+    """
+
     camera_matrix: np.ndarray
     dist_coeffs: np.ndarray
     image_size: tuple[int, int]  # (width, height)
@@ -87,9 +101,11 @@ def calibrate_intrinsics(
             rejected += 1
             continue
         obj, img = board.matchImagePoints(ch_corners, ch_ids)
+        # calibrateCamera wants float32 point arrays.
         all_object.append(obj.astype(np.float32))
         all_image.append(img.astype(np.float32))
 
+    # 5 usable views is a floor for a stable solve, not a target; 20-40 is usual.
     if len(all_object) < 5:
         raise ValueError(
             f"need >= 5 usable images, got {len(all_object)} "
@@ -142,6 +158,8 @@ def calibrate_intrinsics_from_cube(
     """
     from .cube_geometry import CubeModel
     from .detection import CubeDetector
+    # Imported here, not at module top, because detection -> cube_geometry ->
+    # boards -> config; importing them at the top would make a cycle.
 
     cfg = cfg or CalibrationConfig.load()
     model = CubeModel(cfg)
@@ -166,6 +184,9 @@ def calibrate_intrinsics_from_cube(
         fb = model.face_boards[face_det.face]
 
         obj_pts = [fb.chessboard_corners_board_mm[face_det.charuco_local_ids]]
+        # Board-frame (not cube-frame) object points: z = 0 for every point, so
+        # OpenCV's planar (Zhang) initialisation applies, and no inter-face
+        # build error can enter.
         img_pts = [face_det.charuco_corners_px]
         marker_corners_board = fb.marker_corners_board_mm
         for marker_id, corners_px in zip(face_det.marker_ids, face_det.marker_corners_px):
@@ -207,6 +228,7 @@ def calibrate_intrinsics_from_cube(
 
 def save_intrinsics(result: IntrinsicsResult, path: str | Path) -> Path:
     """YAML (stress_3d-compatible field names) plus a sibling .npz."""
+    # The .npz is the lossless copy; YAML floats are rounded for readability.
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -251,6 +273,7 @@ def load_intrinsics(path: str | Path) -> tuple[np.ndarray, np.ndarray, tuple[int
         data = json.loads(text) if path.suffix == ".json" else yaml.safe_load(text)
 
         def as_array(node) -> np.ndarray:
+            """Accept a plain nested list or an OpenCV FileStorage-style matrix dict."""
             # stress_3d files use OpenCV-style {rows, cols, data} dicts.
             if isinstance(node, dict):
                 arr = np.asarray(node["data"], dtype=np.float64)

@@ -46,6 +46,7 @@ def write_face_pngs(model: CubeModel, out_dir: str | Path, dpi: int | None = Non
     for face in cfg.face_order:
         art = face_print_image(model, face, px_per_mm=px_per_mm)
         path = out_dir / f"{face.lower()}.png"
+        # The DPI tag is what lets print software reproduce cube_size_mm exactly.
         Image.fromarray(art).save(path, dpi=(dpi, dpi))
         paths.append(path)
     return paths
@@ -66,6 +67,8 @@ def write_face_pdfs(model: CubeModel, out_dir: str | Path, dpi: int | None = Non
     out_dir.mkdir(parents=True, exist_ok=True)
 
     strip_mm = 40.0  # caption strip height under the face
+    # Page = one face square plus the strip, in inches, at the print DPI, so the
+    # figure's pixel grid maps 1:1 onto the physical millimetre grid.
     page_w_in = cfg.cube_size_mm / MM_PER_INCH
     page_h_in = (cfg.cube_size_mm + strip_mm) / MM_PER_INCH
 
@@ -78,6 +81,8 @@ def write_face_pdfs(model: CubeModel, out_dir: str | Path, dpi: int | None = Non
         face_frac = cfg.cube_size_mm / (cfg.cube_size_mm + strip_mm)
         ax_face = fig.add_axes((0.0, 1.0 - face_frac, 1.0, face_frac))
         ax_face.imshow(art, cmap="gray", vmin=0, vmax=255, interpolation="none")
+        # interpolation="none": any resampling would soften marker edges and
+        # could shift the checker boundaries by a fraction of a pixel.
         ax_face.axis("off")
 
         # Caption strip (outside the detection region).
@@ -136,6 +141,7 @@ def write_cube_net(model: CubeModel, path: str | Path, px_per_mm: float = 0.5) -
     for face, (col, row) in tiles.items():
         art = face_print_image(model, face, px_per_mm=px_per_mm)
         x0, y0 = col * S, (2 - row) * S  # matplotlib y grows upward
+        # Tiles are laid out in mm so the net is dimensionally true at any zoom.
         ax.imshow(art, cmap="gray", vmin=0, vmax=255,
                   extent=(x0, x0 + S, y0, y0 + S), interpolation="none")
         ax.add_patch(plt.Rectangle((x0, y0), S, S, fill=False, ec="tab:red", lw=1.5))
