@@ -5,8 +5,8 @@ meets the stop-to-upload latency target. Three branches, each one variable:
 
 | Branch | What changes | Env knobs |
 |---|---|---|
-| `main` | Baseline. Live MJPEG to H.264 encode, sync re-encode, OpenCV undistort loop plus a third encode for cam1. | `FORCE_CUDA_RECORD` / `REQUIRE_CUDA_RECORD` unset (CPU) |
-| `test/low-res` | Capture resolution knob. Calibration rescales to the capture size. | `RIG_CAPTURE_RES=1280x720` / `960x540` / `854x480` |
+| `main` | Today's pipeline: live MJPEG to H.264 encode, sync re-encode, OpenCV undistort loop plus a third encode for cam1. Writes no timing file, so it is not used for the runs below. | `FORCE_CUDA_RECORD` / `REQUIRE_CUDA_RECORD` unset (CPU) |
+| `test/low-res` | Same pipeline as `main` at the default 1280x720 (the only additions are the resolution knob, calibration rescale and timing output), so it doubles as the baseline. | `RIG_CAPTURE_RES=1280x720` / `960x540` / `854x480` |
 | `test/one-encode` | Recorder stream-copies MJPEG (no encode during the take). One ffmpeg pass per camera at stop does trim, CFR, undistort (cam1) and the only H.264 encode. Includes the low-res knob. | `RIG_RECORD_MODE=copy` (default) / `encode`; `RIG_UNDISTORT_BACKEND=ffmpeg` (default) / `opencv`; `RIG_REMAP_OVERSAMPLE=2`; `RIG_KEEP_RAW=1` to keep the MJPEG |
 
 All runs below are CPU only: leave `FORCE_CUDA_RECORD` and `REQUIRE_CUDA_RECORD`
@@ -25,7 +25,7 @@ Do each run twice. Record everything from the "what to collect" list.
 
 | # | Branch | Env | Purpose |
 |---|---|---|---|
-| R1 | `main` | CPU only, defaults | Baseline. Does the live encode even keep up on the rig CPU? |
+| R1 | `test/low-res` | CPU only, defaults (720p) | Baseline, identical pipeline to `main`. Does the live encode even keep up on the rig CPU? |
 | R2 | `test/low-res` | `RIG_CAPTURE_RES=960x540` | Resolution alone. |
 | R3 | `test/low-res` | `RIG_CAPTURE_RES=854x480` | Resolution alone, lower. |
 | R4 | `test/one-encode` | defaults (`copy`, `ffmpeg`, 720p) | One encode alone. |
@@ -36,33 +36,42 @@ Do each run twice. Record everything from the "what to collect" list.
 
 ## What to collect per run
 
-From the recording folder (`sessions/session_*/recording_N/`):
+Both branches write `recording_N/pipeline_timing.json` at stop. It holds
+almost everything below, so the minimum per run is that one file plus the
+two manual items (8 and 10). Send the whole `recording_N/` folder minus the
+videos if in doubt: `sync/*.log`, `cam*.log`, the three JSON reports and
+`pipeline_timing.json` together are a few hundred KB.
 
-1. `sync/sync_manifest.json`: `fps`, `duration_s`, `successful_cameras`, `warnings`, and in one-encode runs `record_mode` and `undistort`.
-2. `sync/cam*_sync.log`: the last `frame=... speed=...x` line per camera. `speed` is the encode's real-time factor on the rig CPU.
-3. `cam*.log` (raw recorder log): the last `frame=... fps=... drop=... speed=` line. Any `drop=` above 0 or `speed` below 1.0x means the live stage did not keep up.
-4. `processing_status.json`: the `undistort_side` step (backend, and time if present) or `skip_undistort`.
-5. `validation_report.json`: overall `ok` and any failed checks. Frame counts must match across the three cameras.
-6. File sizes in `sync/` (the uploaded set), in MB.
-7. Wall-clock stop latency: time from pressing Stop to the stop response arriving in the UI. Use a stopwatch or the `rig.log` timestamps around `stop_combined`.
+From `pipeline_timing.json`:
+
+1. `stages`: `sync_s`, `postprocess_s`, `validate_s` (and `discard_raw_s` on one-encode), plus `pipeline_s` and `stop_to_ready_s`. `stop_to_ready_s` is the operator-visible stop latency: Stop pressed to the stop response.
+2. `recorders.cam*`: the live recorder's last ffmpeg progress line. `speed` below 1.0x or `drop` above 0 means the take-time stage did not keep up. Missing `drop`/`dup` keys mean zero (ffmpeg only prints them when non-zero); in copy mode there is no fps filter, so they never appear.
+3. `sync_encodes.cam*`: each sync encode's `speed` (real-time factor on the rig CPU) and frame count. Frame counts must match across the three cameras.
+4. `undistort_step`: backend and, for the OpenCV path, `loop_seconds` and `encode_seconds`.
+5. `sync_files_mb`: the uploaded set.
+6. `validation_status` / `validation_usable`, and `config`: capture res, encoders, decoder, CUDA state and the branch knobs. Check `config.cuda_usable` is `false` and `config.sync_encoder` is `libx264` on every run; otherwise the run was not CPU-only.
+
+Still manual:
+
+7. `rig.log` has the same summary on one `[stop]` line per take, useful for a quick scan across runs.
 8. CPU load during the take: `top -bn1 | head -15` once mid-take. Note the ffmpeg processes' CPU percentages.
-9. Upload time for the take from `logs/upload.log` (enqueue to done).
+9. Upload time for the take from `logs/upload.log` (the `Enqueued` and `Uploaded` lines carry timestamps).
 10. Analysis result on the uploaded take, from the cloud side. This is the accuracy number and the only thing the rig cannot measure.
 
 ## Results template
 
 Copy one row per run.
 
-| Run | live drop / speed | sync speed (cam1 / cam2 / cam3) | stop latency s | sync MB (cam1+cam2+cam3) | upload s | validation ok | analysis accuracy | notes |
-|---|---|---|---|---|---|---|---|---|
-| R1 | | | | | | | | |
-| R2 | | | | | | | | |
-| R3 | | | | | | | | |
-| R4 | | | | | | | | |
-| R5 | | | | | | | | |
-| R6 | | | | | | | | |
-| R7 | | | | | | | | |
-| R8 | | | | | | | | |
+| Run | live drop / speed (`recorders`) | sync speed cam1 / cam2 / cam3 (`sync_encodes`) | `stop_to_ready_s` | `sync_s` / `postprocess_s` | sync MB total (`sync_files_mb`) | upload s | `validation_status` | analysis accuracy | notes |
+|---|---|---|---|---|---|---|---|---|---|
+| R1 | | | | | | | | | |
+| R2 | | | | | | | | | |
+| R3 | | | | | | | | | |
+| R4 | | | | | | | | | |
+| R5 | | | | | | | | | |
+| R6 | | | | | | | | | |
+| R7 | | | | | | | | | |
+| R8 | | | | | | | | | |
 
 ## Decision rules
 
