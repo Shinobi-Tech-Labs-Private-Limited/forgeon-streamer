@@ -45,7 +45,9 @@ On-disk layout (BASE_DIR/sessions/)
       sync/                      <cam>_sync_<view>.mp4, ble_sync.json,
                                  heart_rate_sync.jsonl, sync_manifest.json
       distorted/                 original cam1 kept aside after undistortion
-      processing_status.json, validation_report.json
+      processing_status.json, validation_report.json,
+      pipeline_timing.json     per-stage stop timings + run config
+                               (_run_stop_pipeline; docs/test-matrix.md)
 
 Threading model
   Flask runs threaded. Long-lived daemon threads: one preview capture loop
@@ -1863,7 +1865,8 @@ def run_sync_on_dir(recording_dir: Path):
             failures.append({"camera": cam, "returncode": rc})
         else:
             successful.append(cam)
-    sync_log.info("re-encoded %d cameras in %.2fs", len(procs), time.time() - t0)
+    encode_wall_s = round(time.time() - t0, 3)
+    sync_log.info("re-encoded %d cameras in %.2fs", len(procs), encode_wall_s)
 
     output_durations = []
     for cam in successful:
@@ -1896,6 +1899,7 @@ def run_sync_on_dir(recording_dir: Path):
         "successful_cameras": successful,
         "failures": failures,
         "warnings": [] if len(successful) == len(CAMERA_SOURCES) else ["Synchronization does not contain all three cameras"],
+        "encode_wall_s": encode_wall_s,
     }
     if result["ok"]:
         try:
@@ -2687,12 +2691,14 @@ def _undistort_video_file(src: Path, dst: Path, calibration_data: dict) -> dict:
         raise RuntimeError(f"Could not open temporary video writer: {tmp_dst}")
 
     frames_written = 0
+    loop_t0 = time.time()
     while True:
         ok, frame = cap.read()
         if not ok:
             break
         writer.write(cv2.remap(frame, map1, map2, cv2.INTER_LINEAR))
         frames_written += 1
+    loop_seconds = time.time() - loop_t0
 
     cap.release()
     writer.release()
@@ -2711,7 +2717,9 @@ def _undistort_video_file(src: Path, dst: Path, calibration_data: dict) -> dict:
         "-video_track_timescale", "90000",
         str(dst),
     ]
+    encode_t0 = time.time()
     proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    encode_seconds = time.time() - encode_t0
     if proc.returncode != 0:
         raise RuntimeError(f"FFmpeg re-encode failed for undistorted cam1: {proc.stderr[-1000:]}")
 
@@ -2726,7 +2734,171 @@ def _undistort_video_file(src: Path, dst: Path, calibration_data: dict) -> dict:
         "model": candidate.model,
         "path": _rel(dst),
         "encoder": "ffmpeg_sync_encoder",
+        # Timings for the test matrix (docs/test-matrix.md): the Python remap
+        # loop and the extra H.264 encode it forces, separately.
+        "loop_seconds": round(loop_seconds, 3),
+        "encode_seconds": round(encode_seconds, 3),
+        "seconds": round(loop_seconds + encode_seconds, 3),
     }
+
+
+FFMPEG_PROGRESS_RE = re.compile(
+    r"frame=\s*(?P<frame>\d+).*?fps=\s*(?P<fps>[\d.]+).*?"
+    r"(?:dup=\s*(?P<dup>\d+).*?drop=\s*(?P<drop>\d+).*?)?speed=\s*(?P<speed>[\d.]+)x"
+)
+
+
+def _ffmpeg_log_stats(log_path: Path) -> dict | None:
+    """Last progress line of an ffmpeg log as {frame, fps, dup, drop, speed}.
+
+    ffmpeg writes progress with carriage returns, so the file is split on
+    both \r and \n. `speed` is the real-time factor (>= 1.0 kept up),
+    `drop`/`dup` come from the fps filter (encode-mode recorders only).
+    Returns None when the log is missing or carries no progress line.
+    """
+    if not log_path.exists():
+        return None
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    last = None
+    for line in re.split(r"[\r\n]+", text):
+        m = FFMPEG_PROGRESS_RE.search(line)
+        if m:
+            last = m
+    if last is None:
+        return None
+    out = {"frame": int(last.group("frame")), "fps": float(last.group("fps")), "speed": float(last.group("speed"))}
+    if last.group("dup") is not None:
+        out["dup"] = int(last.group("dup"))
+        out["drop"] = int(last.group("drop"))
+    return out
+
+
+def _read_version_file() -> str | None:
+    """Contents of the repository VERSION file (the rig release number), or None."""
+    try:
+        return (BASE_DIR / "VERSION").read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def _pipeline_config() -> dict:
+    """The knobs that define a test-matrix run, recorded next to its timings
+    so every recording folder says how it was produced (docs/test-matrix.md).
+    """
+    record_enc = best_record_encoder_args()
+    sync_enc = best_sync_encoder_args()
+    cfg = {
+        "version": _read_version_file(),
+        "capture_res": f"{CAPTURE_WIDTH}x{CAPTURE_HEIGHT}",
+        "target_fps": TARGET_FPS_WRITE,
+        "cuda_usable": bool(_ffmpeg_has_usable_cuda()),
+        "force_cuda": FORCE_CUDA_RECORD,
+        "require_cuda": REQUIRE_CUDA_RECORD,
+        "record_encoder": record_enc[record_enc.index("-c:v") + 1] if "-c:v" in record_enc else None,
+        "record_decoder": "mjpeg_cuvid" if any("mjpeg_cuvid" in a for a in best_record_decode_args()) else "software",
+        "sync_encoder": sync_enc[sync_enc.index("-c:v") + 1] if "-c:v" in sync_enc else None,
+        "cpu_count": os.cpu_count(),
+        "platform": platform.platform(),
+    }
+    # Knobs that only exist on some branches (test/one-encode).
+    for name in ("RECORD_MODE", "UNDISTORT_BACKEND", "REMAP_OVERSAMPLE", "KEEP_RAW"):
+        if name in globals():
+            cfg[name.lower()] = globals()[name]
+    return cfg
+
+
+def _run_stop_pipeline(recording_dir: Path, stop_started_at: float | None = None) -> dict:
+    """Run sync -> post-process -> validate for a finished take and write
+    recording_N/pipeline_timing.json.
+
+    The timing file is the primary measurement for docs/test-matrix.md: wall
+    seconds per stage, the total, the configuration that produced the take
+    (_pipeline_config), the recorders' last ffmpeg progress line (drop /
+    speed), the sync encodes' speed per camera, and the synced file sizes.
+    Also logged as one summary line on rig.log. Returns the timing dict.
+    """
+    stages = {}
+    t_total = time.time()
+
+    t0 = time.time()
+    sync_result = run_sync_on_dir(recording_dir)
+    stages["sync_s"] = round(time.time() - t0, 3)
+
+    t0 = time.time()
+    processing = postprocess_recording_for_upload(recording_dir)
+    stages["postprocess_s"] = round(time.time() - t0, 3)
+
+    t0 = time.time()
+    validation = validate_recording(recording_dir)
+    stages["validate_s"] = round(time.time() - t0, 3)
+
+    extra = _stop_pipeline_extra(recording_dir, sync_result, validation)
+    if extra:
+        stages.update(extra)
+
+    pipeline_s = round(time.time() - t_total, 3)
+    now = time.time()
+    timing = {
+        "recording_dir": str(recording_dir.relative_to(BASE_DIR)) if recording_dir.is_relative_to(BASE_DIR) else str(recording_dir),
+        "config": _pipeline_config(),
+        "stages": stages,
+        "pipeline_s": pipeline_s,
+        # From the operator pressing Stop (stop_combined entry) to the end of
+        # validation: what the UI actually waits for.
+        "stop_to_ready_s": round(now - stop_started_at, 3) if stop_started_at else None,
+        "sync_ok": bool((sync_result or {}).get("ok")),
+        "sync_duration_s": (sync_result or {}).get("duration_s"),
+        "sync_fps": (sync_result or {}).get("fps"),
+        "sync_encode_wall_s": (sync_result or {}).get("encode_wall_s"),
+        "undistort_step": next(
+            (step for step in (processing or {}).get("steps", []) if step.get("name") in ("undistort_side", "skip_undistort")),
+            None,
+        ),
+        "validation_status": (validation or {}).get("status"),
+        "validation_usable": bool((validation or {}).get("usable")),
+        "recorders": {},
+        "sync_encodes": {},
+        "sync_files_mb": {},
+        "written_at": datetime.now(timezone.utc).isoformat(),
+    }
+    for cam in CAMERA_SOURCES.keys():
+        rec_stats = _ffmpeg_log_stats(recording_dir / f"{cam}.log")
+        if rec_stats:
+            timing["recorders"][cam] = rec_stats
+        sync_stats = _ffmpeg_log_stats(recording_dir / "sync" / f"{cam}_sync.log")
+        if sync_stats:
+            timing["sync_encodes"][cam] = sync_stats
+        suffix = CAMERA_NAME_MAPPING.get(cam, cam)
+        sync_file = recording_dir / "sync" / f"{cam}_sync_{suffix}.mp4"
+        if sync_file.exists():
+            timing["sync_files_mb"][cam] = round(sync_file.stat().st_size / (1024 * 1024), 2)
+
+    try:
+        (recording_dir / "pipeline_timing.json").write_text(json.dumps(timing, indent=2), encoding="utf-8")
+    except OSError as exc:
+        rig_log.warning("[stop] could not write pipeline_timing.json: %s", exc)
+
+    rig_log.info(
+        "[stop] %s pipeline %.2fs (sync %.2fs, postprocess %.2fs, validate %.2fs) stop->ready %s s | "
+        "recorders %s | sync speed %s | validation %s | cfg %s",
+        recording_dir.name, pipeline_s, stages["sync_s"], stages["postprocess_s"], stages["validate_s"],
+        timing["stop_to_ready_s"],
+        {c: f"drop={v.get('drop', '-')} speed={v['speed']}x" for c, v in timing["recorders"].items()},
+        {c: f"{v['speed']}x" for c, v in timing["sync_encodes"].items()},
+        timing["validation_status"],
+        {k: timing["config"][k] for k in ("capture_res", "record_encoder", "record_decoder", "sync_encoder", "cuda_usable")},
+    )
+    return timing
+
+
+def _stop_pipeline_extra(recording_dir: Path, sync_result: dict, validation: dict) -> dict:
+    """Hook for branch-specific post-validation work (returns extra stage
+    timings). Nothing on this branch.
+    """
+    return {}
 
 
 def postprocess_recording_for_upload(recording_dir: Path) -> dict:
@@ -3096,9 +3268,7 @@ def stop_recording_all(process_outputs: bool = True):
     record_procs.clear()
 
     if process_outputs and current_recording_dir and current_recording_dir.exists():
-        run_sync_on_dir(current_recording_dir)
-        postprocess_recording_for_upload(current_recording_dir)
-        validate_recording(current_recording_dir)
+        _run_stop_pipeline(current_recording_dir)
 
     for k in CAMERA_SOURCES.keys():
         reopen_capture_evts[k].set()
@@ -4402,6 +4572,7 @@ def stop_combined():
     if not is_recording_evt.is_set():
         return {"ok": False, "message": "Recording not running"}
 
+    stop_started_at = time.time()
     ble_log = None
     ble_stop_error = None
     mic_log = None
@@ -4453,13 +4624,13 @@ def stop_combined():
         log_exception(logging.getLogger("rig.mic"), "Mic stop failed during stop_combined")
         mic_stop_error = str(e)
 
+    timing = None
     if current_recording_dir and current_recording_dir.exists():
-        run_sync_on_dir(current_recording_dir)
-        postprocess_recording_for_upload(current_recording_dir)
-        validate_recording(current_recording_dir)
+        timing = _run_stop_pipeline(current_recording_dir, stop_started_at)
 
     out = {
         "ok": True,
+        "timing": timing,
         "recording_index": recording_index,
         "recording_dir": str(current_recording_dir.relative_to(BASE_DIR)) if current_recording_dir else None,
         "files": _get_recording_files_info(current_recording_dir) if current_recording_dir else {},
