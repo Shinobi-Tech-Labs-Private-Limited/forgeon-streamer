@@ -1,5 +1,16 @@
 # Changelog
 
+## test/low-res — capture resolution experiment (2026-09-10, branch `test/low-res`)
+
+Step 3 of the upload-latency discussion: make the camera capture size a knob and
+measure what lowering it buys. `RIG_CAPTURE_RES` (default `1280x720`) feeds
+`v4l2rtspserver -W/-H` for all three Pis; the preview never upscales past it;
+`_candidate_from_calibration()` rescales a same-aspect 1280x720 calibration to the
+recorded size so cam1 undistortion keeps working. New `tools/lowres_bench.py`
+replays the record / sync / undistort pipeline at several sizes; numbers and
+findings in `docs/lowres-benchmark.md`. Not for production until the analysis
+accuracy at the lower size is confirmed.
+
 ## V14-pre — pairing enrollment (2026-08-20, branch `feat/rig-upload-worker`)
 
 Phase 5: `/pair` page + `POST /api/pairing/claim` exchange an admin-minted

@@ -63,7 +63,7 @@ Environment knobs
   CAMERA_BOOTSTRAP_ENABLED, FORCE_CUDA_RECORD / REQUIRE_CUDA_RECORD,
   APP_USE_CASE (default sport), MIC_CAMERA_KEY, RIG_LOG_LEVEL /
   RIG_BLE_LOG_LEVEL, FORGEON_API_URL / FORGEON_DEVICE_TOKEN (debug override
-  for the pairing file).
+  for the pairing file), RIG_CAPTURE_RES (camera WxH, default 1280x720).
 
 Route map (JSON unless noted)
   UI pages     /  /pair  /calibration  /recording                    (HTML)
@@ -176,6 +176,32 @@ CAMERA_BOOTSTRAP_ENABLED = os.environ.get("CAMERA_BOOTSTRAP_ENABLED", "1").strip
 )
 CAMERA_BOOTSTRAP_BACKOFF = (2, 5, 10)
 CAMERA_BOOTSTRAP_HEALTHCHECK_SEC = 5.0
+
+
+def _parse_capture_res(raw: str, default: tuple[int, int] = (1280, 720)) -> tuple[int, int]:
+    """Parse RIG_CAPTURE_RES ("WxH") into (width, height); fall back to default.
+
+    The value is handed to v4l2rtspserver -W/-H on every camera Pi, so it must
+    be an MJPEG mode the sensor actually advertises (check with
+    `v4l2-ctl --list-formats-ext` on the Pi). Both sides are forced even so
+    the H.264 encoders and the undistortion maps get 4:2:0-friendly frames.
+    """
+    m = re.fullmatch(r"\s*(\d{3,4})\s*[xX]\s*(\d{3,4})\s*", raw or "")
+    if not m:
+        return default
+    w, h = int(m.group(1)), int(m.group(2))
+    if w < 320 or h < 240:
+        return default
+    return (w - w % 2, h - h % 2)
+
+
+# test/low-res: capture resolution requested from every camera Pi. Default is
+# the as-built 1280x720. Lowering it shrinks MJPEG decode work during the take,
+# every post-stop re-encode pass, and the uploaded files. Calibration JSONs
+# captured at 1280x720 are rescaled on the fly by _candidate_from_calibration()
+# as long as the aspect ratio matches. See tools/lowres_bench.py for numbers.
+CAPTURE_RES = _parse_capture_res(os.environ.get("RIG_CAPTURE_RES", ""))
+CAPTURE_WIDTH, CAPTURE_HEIGHT = CAPTURE_RES
 CAMERA_BOOTSTRAP = {
     "cam1": {
         "name": "side camera",
@@ -195,9 +221,9 @@ CAMERA_BOOTSTRAP = {
             "-f",
             "MJPG",
             "-W",
-            "1280",
+            str(CAPTURE_WIDTH),
             "-H",
-            "720",
+            str(CAPTURE_HEIGHT),
             "-F",
             "90",
             "-s",
@@ -222,9 +248,9 @@ CAMERA_BOOTSTRAP = {
             "-f",
             "MJPG",
             "-W",
-            "1280",
+            str(CAPTURE_WIDTH),
             "-H",
-            "720",
+            str(CAPTURE_HEIGHT),
             "-F",
             "90",
             # NOTE: cam1/cam3 pass "-s /dev/video0" but cam2 passes a bare
@@ -252,9 +278,9 @@ CAMERA_BOOTSTRAP = {
             "-f",
             "MJPG",
             "-W",
-            "1280",
+            str(CAPTURE_WIDTH),
             "-H",
-            "720",
+            str(CAPTURE_HEIGHT),
             "-F",
             "90",
             "-s",
@@ -284,7 +310,8 @@ lens_last_error = {k: None for k in CAMERA_SOURCES}
 # The preview loop resizes to FRAME_SIZE and is throttled (fps / JPEG quality)
 # while a take is running so the MJPEG generators leave CPU for the encoders.
 # TARGET_FPS_WRITE is the constant frame rate forced on every recording.
-FRAME_SIZE = (1280, 720)  # preview resize only
+# Never upscale the preview past what the camera sends (test/low-res).
+FRAME_SIZE = (min(1280, CAPTURE_WIDTH), min(720, CAPTURE_HEIGHT))  # preview resize only
 
 STREAM_THROTTLE_ON_RECORD = True
 NORMAL_PREVIEW_FPS = 25.0
@@ -2576,18 +2603,51 @@ def _save_uploaded_calibration_json(data: dict) -> dict:
     return saved
 
 
-def _candidate_from_calibration(data: dict) -> tuple[CalibrationCandidate, tuple[int, int]]:
+def _candidate_from_calibration(
+    data: dict, target_size: tuple[int, int] | None = None
+) -> tuple[CalibrationCandidate, tuple[int, int]]:
     """Rebuild the calibrator's CalibrationCandidate from stored JSON so that
     make_maps() can produce undistortion maps. Returns (candidate, (w, h)).
+
+    test/low-res: when ``target_size`` differs from the calibration's own
+    image_size but has the same aspect ratio, the intrinsics are rescaled to
+    the target. Focal lengths and principal point scale linearly with the
+    image; distortion coefficients are expressed in normalised coordinates
+    and stay as they are. A mismatched aspect ratio raises, because a crop
+    (not a resize) happened somewhere and the calibration no longer applies.
     """
     image_size = (int(data["image_size"]["width"]), int(data["image_size"]["height"]))
+    camera_matrix = np.array(data["camera_matrix"], dtype=np.float64)
+    new_camera_matrix = np.array(data["new_camera_matrix"], dtype=np.float64)
+    roi = tuple(data.get("roi") or (0, 0, image_size[0], image_size[1]))
+
+    if target_size is not None and tuple(target_size) != image_size:
+        sx = target_size[0] / image_size[0]
+        sy = target_size[1] / image_size[1]
+        if abs(sx - sy) > 0.01:
+            raise RuntimeError(
+                f"Calibration is {image_size[0]}x{image_size[1]} but the video is "
+                f"{target_size[0]}x{target_size[1]}; aspect ratios differ, so the "
+                "calibration cannot be rescaled. Recalibrate at the capture resolution."
+            )
+        scale = np.array([[sx, 0.0, 0.0], [0.0, sy, 0.0], [0.0, 0.0, 1.0]])
+        camera_matrix = scale @ camera_matrix
+        new_camera_matrix = scale @ new_camera_matrix
+        roi = (
+            int(round(roi[0] * sx)),
+            int(round(roi[1] * sy)),
+            int(round(roi[2] * sx)),
+            int(round(roi[3] * sy)),
+        )
+        image_size = (int(target_size[0]), int(target_size[1]))
+
     candidate = CalibrationCandidate(
         model=data.get("selected_model") or data.get("model"),
         rms=float(data.get("rms_reprojection_error_px") or 0.0),
-        camera_matrix=np.array(data["camera_matrix"], dtype=np.float64),
+        camera_matrix=camera_matrix,
         dist_coeffs=np.array(data["distortion_coefficients"], dtype=np.float64).reshape(-1, 1),
-        new_camera_matrix=np.array(data["new_camera_matrix"], dtype=np.float64),
-        roi=tuple(data.get("roi") or (0, 0, image_size[0], image_size[1])),
+        new_camera_matrix=new_camera_matrix,
+        roi=roi,
         rvecs=[],
         tvecs=[],
     )
@@ -2599,10 +2659,10 @@ def _undistort_video_file(src: Path, dst: Path, calibration_data: dict) -> dict:
     intermediate, then a final ffmpeg re-encode with best_sync_encoder_args().
 
     OpenCV's own H.264 writer is unreliable across builds, hence the two
-    stages. Raises RuntimeError if the video size does not match the
-    calibration's image_size or no frame was written.
+    stages. Raises RuntimeError if the video's aspect ratio does not match
+    the calibration's image_size (a same-aspect size difference is handled by
+    rescaling the intrinsics) or no frame was written.
     """
-    candidate, image_size = _candidate_from_calibration(calibration_data)
     cap = cv2.VideoCapture(str(src))
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video for undistortion: {src}")
@@ -2610,12 +2670,13 @@ def _undistort_video_file(src: Path, dst: Path, calibration_data: dict) -> dict:
     width = int(round(cap.get(cv2.CAP_PROP_FRAME_WIDTH)))
     height = int(round(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
     fps = cap.get(cv2.CAP_PROP_FPS) or TARGET_FPS_WRITE
-    if (width, height) != image_size:
+    # test/low-res: rescale the calibration to the recorded size instead of
+    # refusing; only an aspect-ratio mismatch is fatal (raised inside).
+    try:
+        candidate, image_size = _candidate_from_calibration(calibration_data, (width, height))
+    except RuntimeError:
         cap.release()
-        raise RuntimeError(
-            f"Video size mismatch for {src}: {width}x{height}, "
-            f"expected {image_size[0]}x{image_size[1]} from calibration."
-        )
+        raise
 
     map1, map2 = make_maps(candidate, image_size)
     dst.parent.mkdir(parents=True, exist_ok=True)

@@ -40,6 +40,7 @@ None of the following is imported by V13:
 | `focus.py` | Earlier standalone focus meter | `.venv/bin/python tools/focus.py` |
 | `led.py` | Standalone BLE/HTTP LED synchronization utility | `.venv/bin/python tools/led.py` |
 | `multicam_snap.py` | Interactive multi-camera snapshot utility | `.venv/bin/python tools/multicam_snap.py` |
+| `lowres_bench.py` | Replays the record/sync/undistort pipeline at several capture resolutions and reports time, size, PSNR/SSIM (docs/lowres-benchmark.md) | `.venv/bin/python tools/lowres_bench.py --src take.mp4` |
 
 These files were kept as tools because they are self-contained and may still
 be useful during rig setup or diagnostics. They are not production service
