@@ -3,6 +3,8 @@ sessions/
 heartbeat_sessions/
 calibration_cam*/
 *.mp4
+*.mkv
+*.pgm
 *.npz
 *.jsonl
 *.wav

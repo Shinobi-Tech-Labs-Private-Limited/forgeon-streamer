@@ -38,13 +38,18 @@ On-disk layout (BASE_DIR/sessions/)
     calibration/                 calibration_cam1.json/.npz, detections, previews
     snaps/snap_<ts>/<cam>.jpg    calibration / snapshot captures + manifest
     recording_N/
-      <cam>.mp4, <cam>.log       raw FFmpeg output; the log carries the
-                                 wall-clock "start:" used for synchronisation
+      <cam>.mp4 | <cam>.mkv      raw FFmpeg output: H.264 mp4 in encode mode,
+      <cam>.log                  MJPEG stream-copy mkv in copy mode (deleted
+                                 after a validated sync unless RIG_KEEP_RAW);
+                                 the log carries the wall-clock "start:" used
+                                 for synchronisation
       ble/                       insole WAL (.bin), assignment map, decoded JSON
       heartbeat/, audio/         HR JSONL and mic WAV
       sync/                      <cam>_sync_<view>.mp4, ble_sync.json,
-                                 heart_rate_sync.jsonl, sync_manifest.json
+                                 heart_rate_sync.jsonl, sync_manifest.json,
+                                 cam1_xmap.pgm / cam1_ymap.pgm (ffmpeg remap)
       distorted/                 original cam1 kept aside after undistortion
+                                 (opencv undistort backend only)
       processing_status.json, validation_report.json,
       pipeline_timing.json     per-stage stop timings + run config
                                (_run_stop_pipeline; docs/test-matrix.md)
@@ -65,7 +70,10 @@ Environment knobs
   CAMERA_BOOTSTRAP_ENABLED, FORCE_CUDA_RECORD / REQUIRE_CUDA_RECORD,
   APP_USE_CASE (default sport), MIC_CAMERA_KEY, RIG_LOG_LEVEL /
   RIG_BLE_LOG_LEVEL, FORGEON_API_URL / FORGEON_DEVICE_TOKEN (debug override
-  for the pairing file), RIG_CAPTURE_RES (camera WxH, default 1280x720).
+  for the pairing file), RIG_CAPTURE_RES (camera WxH, default 1280x720),
+  RIG_RECORD_MODE copy|encode, RIG_UNDISTORT_BACKEND ffmpeg|opencv,
+  RIG_REMAP_OVERSAMPLE 1..3, RIG_KEEP_RAW (see the block after
+  REQUIRE_CUDA_RECORD).
 
 Route map (JSON unless noted)
   UI pages     /  /pair  /calibration  /recording                    (HTML)
@@ -323,6 +331,50 @@ RECORDING_JPEG_QUALITY = 55
 TARGET_FPS_WRITE = 90
 FORCE_CUDA_RECORD = os.environ.get("FORCE_CUDA_RECORD", "").strip().lower() in ("1", "true", "yes", "on")
 REQUIRE_CUDA_RECORD = os.environ.get("REQUIRE_CUDA_RECORD", "").strip().lower() in ("1", "true", "yes", "on")
+
+# test/one-encode: how the take is recorded and how cam1 is undistorted.
+#   RIG_RECORD_MODE=copy    (default) the recorder stream-copies the camera's
+#                           MJPEG into <cam>.mkv: no decode and no encode during
+#                           the take. The single H.264 encode happens in
+#                           run_sync_on_dir(). Every MJPEG frame is a keyframe,
+#                           so the sync trim stays frame-exact.
+#   RIG_RECORD_MODE=encode  pre-branch behaviour: live MJPEG->H.264 into
+#                           <cam>.mp4, then a second encode at sync.
+#   RIG_UNDISTORT_BACKEND=ffmpeg (default) cam1 undistortion runs inside the
+#                           sync ffmpeg pass (remap filter, maps written from
+#                           the calibration JSON). opencv = the per-frame
+#                           cv2.remap loop plus a third encode in
+#                           postprocess_recording_for_upload().
+#   RIG_REMAP_OVERSAMPLE    1..3 (default 2). ffmpeg's remap is nearest-
+#                           neighbour; sampling from a 2x upscaled frame gets
+#                           within about 1 dB of cv2's bilinear for ~5% more
+#                           time. 1 = plain nearest-neighbour.
+#   RIG_KEEP_RAW=1          keep <cam>.mkv after a validated sync. Default
+#                           deletes them: MJPEG is ~0.7 GB/min/camera at 720p.
+RECORD_MODE = os.environ.get("RIG_RECORD_MODE", "copy").strip().lower()
+if RECORD_MODE not in ("copy", "encode"):
+    RECORD_MODE = "copy"
+UNDISTORT_BACKEND = os.environ.get("RIG_UNDISTORT_BACKEND", "ffmpeg").strip().lower()
+if UNDISTORT_BACKEND not in ("ffmpeg", "opencv"):
+    UNDISTORT_BACKEND = "ffmpeg"
+try:
+    REMAP_OVERSAMPLE = max(1, min(3, int(os.environ.get("RIG_REMAP_OVERSAMPLE", "2"))))
+except ValueError:
+    REMAP_OVERSAMPLE = 2
+KEEP_RAW = os.environ.get("RIG_KEEP_RAW", "").strip().lower() in ("1", "true", "yes", "on")
+RAW_COPY_SUFFIX = ".mkv"
+
+
+def _raw_video_path(recording_dir: Path, cam: str) -> Path | None:
+    """The raw recording for `cam`: <cam>.mp4 (encode mode) or <cam>.mkv (copy
+    mode), whichever exists; the current mode's extension wins if both do.
+    """
+    order = (RAW_COPY_SUFFIX, ".mp4") if RECORD_MODE == "copy" else (".mp4", RAW_COPY_SUFFIX)
+    for suffix in order:
+        candidate = recording_dir / f"{cam}{suffix}"
+        if candidate.exists():
+            return candidate
+    return None
 
 # Preview capture: give up on a stalled stream after RTSP_TIMEOUT_MS and
 # reconnect with the (cyclic) RTSP_RETRY_BACKOFF delays.
@@ -1581,6 +1633,21 @@ def _get_video_meta(video_path: Path):
     return dur, fps
 
 
+def _get_video_size(video_path: Path) -> tuple[int, int] | None:
+    """(width, height) of the first video stream via ffprobe, or None."""
+    data = _ffprobe_json([
+        "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height", "-of", "json", str(video_path),
+    ])
+    streams = data.get("streams") or [{}]
+    try:
+        w = int(streams[0].get("width") or 0)
+        h = int(streams[0].get("height") or 0)
+    except (TypeError, ValueError):
+        return None
+    return (w, h) if w > 0 and h > 0 else None
+
+
 def _parse_sensor_timestamp(value):
     """Return a Unix timestamp for UTC-aware or legacy local ISO timestamps."""
     if not value:
@@ -1720,31 +1787,155 @@ def _sync_heartbeat_file(recording_dir: Path, sync_start: float, sync_end: float
     }
 
 
+def _write_remap_maps(calibration_data: dict, image_size: tuple[int, int], out_dir: Path,
+                      oversample: int) -> tuple[Path, Path]:
+    """Write cam1's undistortion lookup tables as 16-bit PGMs for ffmpeg's remap filter.
+
+    Same model choice as intrinsic_calibrate_charuco.make_maps() but as float
+    source coordinates (CV_32FC1). ffmpeg's remap is nearest-neighbour, so
+    the maps point into a frame upscaled `oversample` times; _build_sync_cmd()
+    scales by the same factor before remap. Source coordinates that fall
+    outside the frame are set to 65535 so remap paints them with its fill
+    colour (black), matching cv2.remap's constant border.
+    """
+    candidate, size = _candidate_from_calibration(calibration_data, image_size)
+    w, h = size
+    if candidate.model == "fisheye":
+        map_x, map_y = cv2.fisheye.initUndistortRectifyMap(
+            candidate.camera_matrix, candidate.dist_coeffs, np.eye(3),
+            candidate.new_camera_matrix, (w, h), cv2.CV_32FC1,
+        )
+    else:
+        map_x, map_y = cv2.initUndistortRectifyMap(
+            candidate.camera_matrix, candidate.dist_coeffs, None,
+            candidate.new_camera_matrix, (w, h), cv2.CV_32FC1,
+        )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths = (out_dir / "cam1_xmap.pgm", out_dir / "cam1_ymap.pgm")
+    for path, m, limit in zip(paths, (map_x, map_y), (w, h)):
+        outside = (m < 0) | (m > limit - 1)
+        values = np.rint(m * oversample + (oversample - 1) / 2.0)
+        values[outside] = 65535
+        arr = np.clip(values, 0, 65535).astype(">u2")
+        with open(path, "wb") as fh:
+            fh.write(f"P5\n{w} {h}\n65535\n".encode("ascii"))
+            fh.write(arr.tobytes())
+    return paths
+
+
+def _sync_remap_maps(cam: str, raw_path: Path, sync_dir: Path) -> tuple[tuple[Path, Path] | None, dict | None]:
+    """(maps, info) for the sync pass: remap PGMs when `cam` is cam1, the sport
+    needs undistortion and RIG_UNDISTORT_BACKEND=ffmpeg; otherwise (None, info)
+    where info says why (or None for cam2/cam3, which are never undistorted).
+    When maps cannot be built, postprocess_recording_for_upload() falls back
+    to the OpenCV loop because the manifest records applied=False.
+    """
+    if cam != "cam1":
+        return None, None
+    if not calibration_required():
+        return None, {"applied": False, "reason": f"{current_sport()}_mode"}
+    if UNDISTORT_BACKEND != "ffmpeg":
+        return None, {"applied": False, "reason": "opencv_backend"}
+    data = _load_calibration_json()
+    if not data:
+        return None, {"applied": False, "reason": "calibration_missing"}
+    size = _get_video_size(raw_path)
+    if not size:
+        return None, {"applied": False, "reason": "raw_size_unknown"}
+    try:
+        maps = _write_remap_maps(data, size, sync_dir, REMAP_OVERSAMPLE)
+    except Exception as exc:
+        log_exception(sync_log, "Could not build ffmpeg remap maps; falling back to OpenCV undistortion")
+        return None, {"applied": False, "reason": f"map_build_failed: {exc}"}
+    return maps, {
+        "applied": True,
+        "backend": "ffmpeg_remap",
+        "oversample": REMAP_OVERSAMPLE,
+        "camera": "cam1",
+        "source_size": list(size),
+        "maps": [_rel(maps[0]), _rel(maps[1])],
+    }
+
+
+def _build_sync_cmd(raw_path: Path, offset_s: float, duration_s: float, fps: float, out_path: Path,
+                    remap_maps: tuple[Path, Path] | None) -> list:
+    """One ffmpeg pass: trim to the common window, force CFR, optionally
+    undistort (remap), and encode with best_sync_encoder_args().
+
+    Works for both raw kinds: an H.264 mp4 (encode mode; this is the second
+    encode) or an MJPEG mkv (copy mode; this is the only encode, and because
+    every MJPEG frame is a keyframe -ss lands exactly on the requested frame).
+    """
+    cmd = ["ffmpeg", "-y", "-ss", f"{offset_s:.6f}", "-i", str(raw_path)]
+    chain = f"fps={fps:.6f},setpts=PTS-STARTPTS"
+    if remap_maps is None:
+        cmd += ["-t", f"{duration_s:.6f}", "-an", "-sn", "-vf", chain]
+    else:
+        xmap, ymap = remap_maps
+        if REMAP_OVERSAMPLE > 1:
+            chain += f",scale=iw*{REMAP_OVERSAMPLE}:ih*{REMAP_OVERSAMPLE}:flags=bilinear"
+        cmd += [
+            "-i", str(xmap), "-i", str(ymap),
+            "-t", f"{duration_s:.6f}", "-an", "-sn",
+            "-filter_complex", f"[0:v]{chain}[v];[v][1:v][2:v]remap[out]",
+            "-map", "[out]",
+        ]
+    return cmd + best_sync_encoder_args() + [str(out_path)]
+
+
+def _discard_raw_copies(recording_dir: Path, validation: dict | None) -> None:
+    """Copy mode only: delete <cam>.mkv once the take is synced AND validated
+    usable (RIG_KEEP_RAW=1 keeps them). Encode mode never deletes anything.
+    """
+    if RECORD_MODE != "copy" or KEEP_RAW:
+        return
+    sync_ok = bool(_get_sync_status(recording_dir).get("ok"))
+    usable = bool((validation or {}).get("usable"))
+    if not (sync_ok and usable):
+        rig_log.info("[record] keeping raw MJPEG in %s (sync ok=%s, validation usable=%s)",
+                     recording_dir.name, sync_ok, usable)
+        return
+    for cam in CAMERA_SOURCES.keys():
+        raw = recording_dir / f"{cam}{RAW_COPY_SUFFIX}"
+        if not raw.exists():
+            continue
+        try:
+            size_mb = raw.stat().st_size / (1024 * 1024)
+            raw.unlink()
+            rig_log.info("[record] deleted raw MJPEG %s (%.1f MB)", raw.name, size_mb)
+        except OSError as exc:
+            rig_log.warning("[record] could not delete raw MJPEG %s: %s", raw, exc)
+
+
 def run_sync_on_dir(recording_dir: Path):
     """Align the raw per-camera recordings into a common time window.
 
     Algorithm:
-      1. For each cam with both <cam>.mp4 and a 'start:' epoch in <cam>.log,
-         note its wall-clock start.
+      1. For each cam with both a raw recording (<cam>.mp4 or <cam>.mkv, see
+         _raw_video_path) and a 'start:' epoch in <cam>.log, note its
+         wall-clock start.
       2. sync_start = the LATEST start; each camera is trimmed by
          (sync_start - its own start) so frame zero is simultaneous.
       3. common duration = shortest remaining video; common fps = median of
-         the cameras' fps. Every camera is re-encoded in parallel to
-         sync/<cam>_sync_<view>.mp4 with fps=<common>,setpts=PTS-STARTPTS
-         (best_sync_encoder_args), so all outputs have identical frame
-         counts - validate_recording() checks exactly that.
+         the cameras' fps (encode mode) or TARGET_FPS_WRITE (copy mode, where
+         the raw MJPEG carries wall-clock VFR timestamps). Every camera is
+         encoded in parallel to sync/<cam>_sync_<view>.mp4 with
+         fps=<common>,setpts=PTS-STARTPTS (_build_sync_cmd), so all outputs
+         have identical frame counts - validate_recording() checks exactly
+         that. With RIG_UNDISTORT_BACKEND=ffmpeg, cam1 is undistorted inside
+         the same pass (remap filter; manifest key "undistort").
       4. Insole and heart-rate logs are windowed to [sync_start, sync_end]
          (see _sync_ble_file / _sync_heartbeat_file).
-    With a single camera the raw file is copied instead of re-encoded.
-    Everything is summarised in sync/sync_manifest.json (also returned);
-    ok requires >= 2 successfully re-encoded cameras.
+    With a single camera an H.264 raw file is copied; an MJPEG raw is encoded
+    once. Everything is summarised in sync/sync_manifest.json (also returned);
+    ok requires >= 2 successfully encoded cameras.
     """
     sync_dir = recording_dir / "sync"
     sync_dir.mkdir(exist_ok=True)
     available = {}
     for cam in CAMERA_SOURCES.keys():
-        vid_file = recording_dir / f"{cam}.mp4"
-        if not vid_file.exists():
+        vid_file = _raw_video_path(recording_dir, cam)
+        if vid_file is None:
             continue
         st = _read_start_time_from_log(recording_dir / f"{cam}.log")
         if st is not None:
@@ -1761,8 +1952,20 @@ def run_sync_on_dir(recording_dir: Path):
         cam, info = next(iter(available.items()))
         suffix = CAMERA_NAME_MAPPING.get(cam, cam)
         out_path = sync_dir / f"{cam}_sync_{suffix}.mp4"
-        shutil.copy2(info["path"], out_path)
-        duration, fps = _get_video_meta(out_path)
+        undistort_info = None
+        if info["path"].suffix.lower() == ".mp4":
+            shutil.copy2(info["path"], out_path)
+        else:
+            # Copy-mode raw is MJPEG: this is the take's one and only encode.
+            raw_dur, _ = _get_video_meta(info["path"])
+            maps, undistort_info = _sync_remap_maps(cam, info["path"], sync_dir)
+            cmd = _build_sync_cmd(info["path"], 0.0, raw_dur, float(TARGET_FPS_WRITE), out_path, maps)
+            with open(sync_dir / f"{cam}_sync.log", "w", buffering=1) as sync_logf:
+                sync_logf.write("CMD: " + " ".join(cmd) + "\n")
+                rc = subprocess.run(cmd, stdout=sync_logf, stderr=sync_logf).returncode
+            if rc != 0:
+                sync_log.error("%s encode exited with code %s; see sync/%s_sync.log", cam, rc, cam)
+        duration, fps = _get_video_meta(out_path) if out_path.exists() else (0.0, float(TARGET_FPS_WRITE))
         sync_start = info["start"]
         sync_end = sync_start + max(0.0, duration)
         message = f"Only {cam} was available; copied raw video as the synchronized {suffix} view"
@@ -1788,6 +1991,9 @@ def run_sync_on_dir(recording_dir: Path):
             "successful_cameras": [cam] if duration > 0 else [],
             "failures": [] if duration > 0 else [{"camera": cam, "message": "Copied video has no readable duration"}],
             "warnings": [message],
+            "record_mode": RECORD_MODE,
+            "raw_files": {cam: info["path"].name},
+            "undistort": undistort_info,
         }
         if result["ok"]:
             try:
@@ -1820,31 +2026,28 @@ def run_sync_on_dir(recording_dir: Path):
         return result
 
     common_dur = min(usable_durs)
-    fps_values.sort()
-    common_fps = fps_values[len(fps_values) // 2]
+    if any(info["path"].suffix.lower() != ".mp4" for info in available.values()):
+        # Copy-mode raw MJPEG carries wall-clock VFR timestamps; ffprobe's
+        # r_frame_rate is meaningless there. The fps filter below makes the
+        # outputs CFR at the rate the recorders were always meant to produce.
+        common_fps = float(TARGET_FPS_WRITE)
+    else:
+        fps_values.sort()
+        common_fps = fps_values[len(fps_values) // 2]
 
-    # Launch all camera re-encodes in parallel (GPU NVENC when available, else libx264),
-    # then wait on all. Identical inputs/filter/outputs to before — only the encoder backend
-    # and the serial->parallel execution change.
+    # Launch all camera encodes in parallel (GPU NVENC when available, else libx264),
+    # then wait on all. cam1 picks up the remap maps when the ffmpeg undistort
+    # backend is active, so its undistortion costs no extra pass.
     t0 = time.time()
     procs = []
+    undistort_info = None
     for cam, info in available.items():
         suffix = CAMERA_NAME_MAPPING.get(cam, cam)
         out_path = sync_dir / f"{cam}_sync_{suffix}.mp4"
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-ss",
-            f"{offsets[cam]:.6f}",
-            "-i",
-            str(info["path"]),
-            "-t",
-            f"{common_dur:.6f}",
-            "-an",
-            "-sn",
-            "-vf",
-            f"fps={common_fps:.6f},setpts=PTS-STARTPTS",
-        ] + best_sync_encoder_args() + [str(out_path)]
+        maps, cam_undistort = _sync_remap_maps(cam, info["path"], sync_dir)
+        if cam_undistort is not None:
+            undistort_info = cam_undistort
+        cmd = _build_sync_cmd(info["path"], offsets[cam], common_dur, common_fps, out_path, maps)
         # Keep ffmpeg's full output beside the synced file: with stderr sent to
         # DEVNULL a failed re-encode was undiagnosable in principle — only the
         # return code survived.
@@ -1899,6 +2102,9 @@ def run_sync_on_dir(recording_dir: Path):
         "successful_cameras": successful,
         "failures": failures,
         "warnings": [] if len(successful) == len(CAMERA_SOURCES) else ["Synchronization does not contain all three cameras"],
+        "record_mode": RECORD_MODE,
+        "raw_files": {cam: info["path"].name for cam, info in available.items()},
+        "undistort": undistort_info,
         "encode_wall_s": encode_wall_s,
     }
     if result["ok"]:
@@ -2077,22 +2283,19 @@ def build_ffmpeg_record_cmd(src_url: str, out_path: Path):
     """argv for one camera's recorder.
 
     Input: RTSP over TCP with wall-clock timestamps and generous buffers
-    (a 90 fps MJPEG stream bursts). Video filter: settb/fps/setpts force a
-    constant TARGET_FPS_WRITE timeline (frames are duplicated or dropped
-    as needed) and showinfo logs per-frame metadata; the hwdownload step is
-    only present when decoding on the GPU. Output: no audio/subtitles, a
-    90 kHz track timescale so sub-frame timestamps survive the mp4 muxer.
+    (a 90 fps MJPEG stream bursts).
+
+    Copy mode (RIG_RECORD_MODE=copy): the MJPEG packets are written to an
+    mkv untouched (-c:v copy). No decoder, no filter, no encoder; the CFR
+    timeline and the H.264 encode happen once, in run_sync_on_dir().
+
+    Encode mode: settb/fps/setpts force a constant TARGET_FPS_WRITE timeline
+    (frames are duplicated or dropped as needed) and showinfo logs per-frame
+    metadata; the hwdownload step is only present when decoding on the GPU.
+    Output: no audio/subtitles, a 90 kHz track timescale so sub-frame
+    timestamps survive the mp4 muxer.
     """
     fps = int(TARGET_FPS_WRITE)
-
-    dec = best_record_decode_args()
-    enc = best_record_encoder_args()
-    using_cuvid = any("mjpeg_cuvid" in x for x in dec)
-
-    if using_cuvid:
-        vf = f"settb=AVTB,hwdownload,format=nv12,fps={fps},setpts=N/({fps}*TB),showinfo"
-    else:
-        vf = f"settb=AVTB,fps={fps},setpts=N/({fps}*TB),showinfo"
 
     record_input = [
         "-rtsp_transport",
@@ -2112,6 +2315,18 @@ def build_ffmpeg_record_cmd(src_url: str, out_path: Path):
         "-thread_queue_size",
         "8192",
     ]
+
+    if RECORD_MODE == "copy":
+        return ["ffmpeg", "-y"] + record_input + ["-i", src_url, "-an", "-sn", "-c:v", "copy", str(out_path)]
+
+    dec = best_record_decode_args()
+    enc = best_record_encoder_args()
+    using_cuvid = any("mjpeg_cuvid" in x for x in dec)
+
+    if using_cuvid:
+        vf = f"settb=AVTB,hwdownload,format=nv12,fps={fps},setpts=N/({fps}*TB),showinfo"
+    else:
+        vf = f"settb=AVTB,fps={fps},setpts=N/({fps}*TB),showinfo"
 
     return (
         ["ffmpeg", "-y"]
@@ -2160,21 +2375,27 @@ def start_recording_all():
 
     try:
         for cam_key, src in CAMERA_SOURCES.items():
-            out_path = current_recording_dir / f"{cam_key}.mp4"
+            raw_suffix = RAW_COPY_SUFFIX if RECORD_MODE == "copy" else ".mp4"
+            out_path = current_recording_dir / f"{cam_key}{raw_suffix}"
             log_path = current_recording_dir / f"{cam_key}.log"
             cmd = build_ffmpeg_record_cmd(src, out_path)
 
             logf = open(log_path, "w", buffering=1)
             record_logs[cam_key] = logf
             logf.write("CMD: " + " ".join(cmd) + "\n")
-            if "h264_nvenc" in cmd:
-                logf.write("BACKEND: nvenc\n")
-            elif "libx264" in cmd:
-                logf.write("BACKEND: libx264\n")
-            if "mjpeg_cuvid" in cmd:
-                logf.write("DECODE: mjpeg_cuvid\n")
+            logf.write(f"MODE: {RECORD_MODE}\n")
+            if RECORD_MODE == "copy":
+                logf.write("BACKEND: copy (MJPEG passthrough, encoded once at sync)\n")
+                logf.write("DECODE: none\n")
             else:
-                logf.write("DECODE: software\n")
+                if "h264_nvenc" in cmd:
+                    logf.write("BACKEND: nvenc\n")
+                elif "libx264" in cmd:
+                    logf.write("BACKEND: libx264\n")
+                if "mjpeg_cuvid" in cmd:
+                    logf.write("DECODE: mjpeg_cuvid\n")
+                else:
+                    logf.write("DECODE: software\n")
             rig_log.info("[%s] FFmpeg recording started -> %s (log: %s)", cam_key, out_path, log_path)
 
             p = subprocess.Popen(cmd, stdout=logf, stderr=logf, cwd=str(BASE_DIR))
@@ -2895,10 +3116,12 @@ def _run_stop_pipeline(recording_dir: Path, stop_started_at: float | None = None
 
 
 def _stop_pipeline_extra(recording_dir: Path, sync_result: dict, validation: dict) -> dict:
-    """Hook for branch-specific post-validation work (returns extra stage
-    timings). Nothing on this branch.
+    """Post-validation work on this branch: drop the raw MJPEG copies once the
+    take is synced and validated (copy mode only). Returns its stage timing.
     """
-    return {}
+    t0 = time.time()
+    _discard_raw_copies(recording_dir, validation)
+    return {"discard_raw_s": round(time.time() - t0, 3)}
 
 
 def postprocess_recording_for_upload(recording_dir: Path) -> dict:
@@ -2931,10 +3154,26 @@ def postprocess_recording_for_upload(recording_dir: Path) -> dict:
         if not synced_files:
             raise RuntimeError("Need at least 1 synchronized video for upload; found 0.")
 
-        if calibration_required() and "cam1" in synced_files and not calibration_data:
-            raise RuntimeError("Calibration JSON is missing or invalid.")
+        sync_status = _get_sync_status(recording_dir)
+        fused = sync_status.get("undistort") or {}
+        fused_ok = (
+            bool(fused.get("applied"))
+            and "cam1" in (sync_status.get("successful_cameras") or [])
+        )
 
-        if calibration_required() and "cam1" in synced_files:
+        if calibration_required() and "cam1" in synced_files and fused_ok:
+            # The sync pass already undistorted cam1 (ffmpeg remap backend):
+            # nothing to re-encode, and no distorted/ copy exists by design.
+            status["steps"].append({
+                "name": "undistort_side",
+                "backend": fused.get("backend"),
+                "oversample": fused.get("oversample"),
+                "path": _rel(synced_files["cam1"]),
+                "encoder": "sync_pass",
+            })
+        elif calibration_required() and "cam1" in synced_files and not calibration_data:
+            raise RuntimeError("Calibration JSON is missing or invalid.")
+        elif calibration_required() and "cam1" in synced_files:
             sync_side = synced_files["cam1"]
             distorted_side = distorted_dir / "cam1_sync_side.mp4"
             distorted_dir.mkdir(parents=True, exist_ok=True)
@@ -3001,7 +3240,7 @@ def validate_recording(recording_dir: Path) -> dict:
         video_meta = {}
         decoded_frames = {}
         for cam, semantic_name in CAMERA_NAME_MAPPING.items():
-            raw_path = recording_dir / f"{cam}.mp4"
+            raw_path = _raw_video_path(recording_dir, cam) or (recording_dir / f"{cam}.mp4")
             sync_path = recording_dir / "sync" / f"{cam}_sync_{semantic_name}.mp4"
             add("video", f"{cam}_raw_exists", raw_path.exists() and raw_path.stat().st_size > 1024, True,
                 f"{cam} raw video is present" if raw_path.exists() and raw_path.stat().st_size > 1024 else f"{cam} raw video is missing or empty")

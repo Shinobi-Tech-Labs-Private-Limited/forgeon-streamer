@@ -171,19 +171,63 @@ def sync_reencode(raw: Path, encoder: str, fps: float, out: Path, log: Path) -> 
     return dt
 
 
-def undistort_loop(raw: Path, res: tuple[int, int], fps: float, out: Path) -> tuple[float, int] | None:
-    """_undistort_video_file()'s Python loop with synthetic intrinsics."""
-    try:
-        import cv2
-        import numpy as np
-    except Exception:
-        return None
+def synthetic_maps(res: tuple[int, int]):
+    """Float undistortion maps for a made-up pinhole with mild barrel distortion."""
+    import cv2
+    import numpy as np
     w, h = res
     f = 0.9 * w
     K = np.array([[f, 0, w / 2.0], [0, f, h / 2.0], [0, 0, 1]], dtype=np.float64)
     dist = np.array([-0.25, 0.08, 0.0, 0.0, 0.0], dtype=np.float64).reshape(-1, 1)
     newK, _ = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), 0.0, (w, h))
-    map1, map2 = cv2.initUndistortRectifyMap(K, dist, None, newK, (w, h), cv2.CV_16SC2)
+    return cv2.initUndistortRectifyMap(K, dist, None, newK, (w, h), cv2.CV_32FC1)
+
+
+def write_pgm_maps(res: tuple[int, int], out_dir: Path, oversample: int) -> tuple[Path, Path] | None:
+    """16-bit PGM x/y maps for ffmpeg's remap filter (mirrors _write_remap_maps)."""
+    try:
+        import numpy as np
+        map_x, map_y = synthetic_maps(res)
+    except Exception:
+        return None
+    w, h = res
+    paths = (out_dir / f"xmap_{w}x{h}_os{oversample}.pgm", out_dir / f"ymap_{w}x{h}_os{oversample}.pgm")
+    for path, m, limit in zip(paths, (map_x, map_y), (w, h)):
+        outside = (m < 0) | (m > limit - 1)
+        values = np.rint(m * oversample + (oversample - 1) / 2.0)
+        values[outside] = 65535
+        arr = np.clip(values, 0, 65535).astype(">u2")
+        with open(path, "wb") as fh:
+            fh.write(f"P5\n{w} {h}\n65535\n".encode("ascii"))
+            fh.write(arr.tobytes())
+    return paths
+
+
+def one_pass(mjpeg: Path, encoder: str, fps: float, out: Path, log: Path,
+             maps: tuple[Path, Path] | None, oversample: int) -> float:
+    """test/one-encode's _build_sync_cmd(): MJPEG -> trim/CFR (-> remap) -> one H.264 encode."""
+    chain = f"fps={fps:.6f},setpts=PTS-STARTPTS"
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-ss", "0", "-i", str(mjpeg)]
+    if maps is None:
+        cmd += ["-an", "-sn", "-vf", chain]
+    else:
+        if oversample > 1:
+            chain += f",scale=iw*{oversample}:ih*{oversample}:flags=bilinear"
+        cmd += ["-i", str(maps[0]), "-i", str(maps[1]), "-an", "-sn",
+                "-filter_complex", f"[0:v]{chain}[v];[v][1:v][2:v]remap[out]", "-map", "[out]"]
+    dt, _ = run(cmd + sync_enc_args(encoder, int(round(fps))) + [str(out)], log)
+    return dt
+
+
+def undistort_loop(raw: Path, res: tuple[int, int], fps: float, out: Path) -> tuple[float, int] | None:
+    """_undistort_video_file()'s Python loop with synthetic intrinsics."""
+    try:
+        import cv2
+        map_x, map_y = synthetic_maps(res)
+        map1, map2 = cv2.convertMaps(map_x, map_y, cv2.CV_16SC2)
+    except Exception:
+        return None
+    w, h = res
 
     cap = cv2.VideoCapture(str(raw))
     if not cap.isOpened():
@@ -244,6 +288,8 @@ def main() -> int:
     ap.add_argument("--json", type=Path, default=None, help="write results JSON here")
     ap.add_argument("--md", type=Path, default=None, help="write a Markdown report here")
     ap.add_argument("--repeat", type=int, default=1, help="repeat timed stages N times, keep the fastest")
+    ap.add_argument("--oversample", type=int, default=2, choices=(1, 2, 3),
+                    help="remap oversample factor for the one-pass undistort (RIG_REMAP_OVERSAMPLE)")
     args = ap.parse_args()
 
     for tool in ("ffmpeg", "ffprobe"):
@@ -298,6 +344,15 @@ def main() -> int:
             u = undistort_loop(raw, res, fps, und)
             q = quality(args.src, sync, src_res, fps, log_dir, etag)
 
+            # test/one-encode pipeline: MJPEG straight to the sync output.
+            onepass = args.out / f"onepass_{etag}.mp4"
+            onepass_remap = args.out / f"onepass_remap_{etag}.mp4"
+            t_one = best(one_pass, mjpeg, enc, fps, onepass, log_dir / f"onepass_{etag}.log", None, 1)
+            one_meta = probe(onepass)
+            maps = write_pgm_maps(res, args.out, args.oversample)
+            t_one_remap = (best(one_pass, mjpeg, enc, fps, onepass_remap, log_dir / f"onepass_remap_{etag}.log",
+                                maps, args.oversample) if maps else None)
+
             row = {
                 "res": tag, "width": w, "height": h, "encoder": enc,
                 "pixels_rel": (w * h) / (src_res[0] * src_res[1]),
@@ -313,6 +368,19 @@ def main() -> int:
                 "undistort_x_realtime": (duration / u[0]) if u and u[0] else None,
                 "psnr_db": q.get("psnr_db"), "ssim": q.get("ssim"),
                 "sync_path": str(sync),
+                # one-encode pipeline
+                "onepass_s": t_one, "onepass_x_realtime": duration / t_one if t_one else None,
+                "onepass_mb": mb(one_meta["size"]),
+                "onepass_remap_s": t_one_remap,
+                "onepass_remap_x_realtime": (duration / t_one_remap) if t_one_remap else None,
+                "remap_oversample": args.oversample,
+                # pipeline totals (CPU seconds of ffmpeg/OpenCV work per camera).
+                # current cam1 = record + sync + undistort loop + final encode
+                # (the final encode is the sync encoder again, so sync_s stands in for it).
+                "current_total_cam23_s": t_rec + t_sync,
+                "current_total_cam1_s": (t_rec + t_sync + u[0] + t_sync) if u else None,
+                "onepass_total_cam23_s": t_one,
+                "onepass_total_cam1_s": t_one_remap,
             }
             rows.append(row)
             print(f"   [{enc:5}] record {t_rec:6.2f}s ({row['record_x_realtime']:.1f}x rt) raw {row['raw_mb']:.2f} MB | "
@@ -320,6 +388,10 @@ def main() -> int:
                   f"({row['sync_mb_per_min']:.0f} MB/min) | "
                   + (f"undistort {u[0]:6.2f}s ({row['undistort_x_realtime']:.1f}x rt) | " if u else "undistort n/a | ")
                   + f"PSNR {q.get('psnr_db')} dB SSIM {q.get('ssim')}")
+            print(f"           one-pass {t_one:6.2f}s ({row['onepass_x_realtime']:.1f}x rt) {row['onepass_mb']:.2f} MB | "
+                  + (f"one-pass+remap {t_one_remap:6.2f}s ({row['onepass_remap_x_realtime']:.1f}x rt) | " if t_one_remap else "")
+                  + f"totals cam2/3 {row['current_total_cam23_s']:.2f}s -> {t_one:.2f}s"
+                  + (f", cam1 {row['current_total_cam1_s']:.2f}s -> {t_one_remap:.2f}s" if u and t_one_remap else ""))
             try:
                 und.unlink()
             except OSError:
@@ -389,6 +461,21 @@ def render_md(result: dict) -> str:
             return f"{r[k] / b[k] * 100:.0f}%" if r.get(k) and b.get(k) else "n/a"
         lines.append(f"| {r['res']} | {r['encoder']} | {rel('record_s')} | {rel('sync_s')} | "
                      f"{rel('undistort_s')} | {rel('sync_mb')} |")
+    lines += [
+        "",
+        "Current pipeline vs one encode (test/one-encode), total encode/undistort seconds per camera "
+        "for this clip. Current cam1 = record + sync + undistort loop + final encode (approximated by "
+        "the sync encode time). One-encode cam1 includes the ffmpeg remap "
+        f"(oversample {result['rows'][0].get('remap_oversample') if result['rows'] else '?'}).",
+        "",
+        "| res | enc | current cam2/3 s | one-encode cam2/3 s | current cam1 s | one-encode cam1 s | one-encode MB |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for r in result["rows"]:
+        def f(k):
+            return f"{r[k]:.2f}" if r.get(k) else "n/a"
+        lines.append(f"| {r['res']} | {r['encoder']} | {f('current_total_cam23_s')} | {f('onepass_total_cam23_s')} | "
+                     f"{f('current_total_cam1_s')} | {f('onepass_total_cam1_s')} | {f('onepass_mb')} |")
     lines += [
         "",
         "PSNR/SSIM are measured after upscaling the sync output back to the source size, so they "

@@ -1,5 +1,19 @@
 # Changelog
 
+## test/one-encode — one H.264 encode per camera (2026-09-10, branch `test/one-encode`)
+
+CPU-only goal. `RIG_RECORD_MODE=copy` (default on this branch) makes each recorder
+stream-copy the camera's MJPEG into `<cam>.mkv`: no decode, no encode during the
+take. `run_sync_on_dir()` then does the only encode per camera in one ffmpeg pass
+(`_build_sync_cmd`: frame-exact trim, CFR, and for cam1 the undistortion via the
+remap filter with maps written from the calibration JSON by `_write_remap_maps`,
+`RIG_UNDISTORT_BACKEND=ffmpeg`, `RIG_REMAP_OVERSAMPLE=2`). The OpenCV undistort loop
+and its extra encode are skipped when the manifest says the sync pass already
+undistorted cam1. Raw MJPEG is deleted after a validated sync (`RIG_KEEP_RAW=1`
+keeps it). `RIG_RECORD_MODE=encode RIG_UNDISTORT_BACKEND=opencv` restores the
+pre-branch pipeline for A/B runs. Bench in `docs/one-encode-benchmark.md`, rig test
+plan in `docs/test-matrix.md`. Includes everything on `test/low-res`.
+
 ## test/low-res — capture resolution experiment (2026-09-10, branch `test/low-res`)
 
 Step 3 of the upload-latency discussion: make the camera capture size a knob and
