@@ -15,6 +15,11 @@ encode is cut with `-frames:v` at floor(duration*fps) so the three cameras get
 identical frame counts (they were off by one on every pipeline, failing the
 required validation check); copy-mode recorder progress (no `frame=`) is parsed
 into `recorders.<cam>.time_s` / `speed`.
+`RIG_SYNC_DECODER=auto` (default) decodes copy-mode MJPEG with `mjpeg_cuvid` in the
+sync pass when CUDA is usable: R9 showed the NVENC sync capped at 1.0x by the
+software MJPEG decode. Frames return to system memory so fps/remap/scale are
+unchanged; a `setparams` reset of the decoder's reserved colour tags keeps swscale
+happy on ffmpeg 8 as well as 6.1.
 
 ## test/one-encode — one H.264 encode per camera (2026-09-10, branch `test/one-encode`)
 

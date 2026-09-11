@@ -401,6 +401,15 @@ if OUTPUT_RES:
     except ValueError:
         OUTPUT_RES = ""
 PAUSE_PREVIEW_ON_STOP = os.environ.get("RIG_PAUSE_PREVIEW_ON_STOP", "1").strip().lower() in ("1", "true", "yes", "on")
+#   RIG_SYNC_DECODER   auto (default) decodes the raw MJPEG with mjpeg_cuvid in
+#                      the sync pass when CUDA is usable (frames come back to
+#                      system memory so fps/remap/scale run unchanged and NVENC
+#                      takes them from there); software = ffmpeg's CPU decoder.
+#                      Rig run R9 showed the NVENC sync capped at ~1.0x by the
+#                      software MJPEG decode. Copy-mode raws only.
+SYNC_DECODER = os.environ.get("RIG_SYNC_DECODER", "auto").strip().lower()
+if SYNC_DECODER not in ("auto", "software"):
+    SYNC_DECODER = "auto"
 
 
 def _raw_video_path(recording_dir: Path, cam: str) -> Path | None:
@@ -1909,6 +1918,29 @@ def _sync_remap_maps(cam: str, raw_path: Path, sync_dir: Path) -> tuple[tuple[Pa
     }
 
 
+def _sync_decode_args(raw_path: Path) -> list:
+    """Input options for the sync pass: mjpeg_cuvid for a copy-mode MJPEG raw
+    when CUDA is usable and RIG_SYNC_DECODER=auto, else nothing (software).
+    Deliberately without -hwaccel_output_format cuda: the filters that follow
+    (fps, scale, remap) are CPU filters, so decoded frames must land in system
+    memory. NVENC uploads them again; at 720p90 that copy is negligible next
+    to the decode it replaces.
+    """
+    if SYNC_DECODER != "auto" or raw_path.suffix.lower() != RAW_COPY_SUFFIX:
+        return []
+    if platform.system().lower() not in ("linux", "windows"):
+        return []
+    if _ffmpeg_has_decoder("mjpeg_cuvid") and _record_cuda_enabled():
+        return ["-c:v", "mjpeg_cuvid"]
+    return []
+
+
+def _sync_decoder_name(raw_path: Path | None = None) -> str:
+    """'mjpeg_cuvid' or 'software' for the config record."""
+    probe = raw_path or Path(f"cam1{RAW_COPY_SUFFIX}")
+    return "mjpeg_cuvid" if "mjpeg_cuvid" in _sync_decode_args(probe) else "software"
+
+
 def _build_sync_cmd(raw_path: Path, offset_s: float, duration_s: float, fps: float, out_path: Path,
                     remap_maps: tuple[Path, Path] | None) -> list:
     """One ffmpeg pass: trim to the common window, force CFR, optionally
@@ -1925,8 +1957,14 @@ def _build_sync_cmd(raw_path: Path, offset_s: float, duration_s: float, fps: flo
     # with -t one frame period longer as the safety net.
     n_frames = max(1, int(duration_s * fps + 1e-3))
     limit_s = duration_s + (1.0 / fps if fps > 0 else 0.0)
-    cmd = ["ffmpeg", "-y", "-ss", f"{offset_s:.6f}", "-i", str(raw_path)]
+    decode = _sync_decode_args(raw_path)
+    cmd = ["ffmpeg", "-y", "-ss", f"{offset_s:.6f}"] + decode + ["-i", str(raw_path)]
     chain = f"fps={fps:.6f},setpts=PTS-STARTPTS"
+    if decode:
+        # mjpeg_cuvid hands back NV12 tagged with "reserved" primaries/transfer;
+        # newer swscale refuses to convert such frames for remap/scale. Restate
+        # what the camera's JPEG actually is (full-range bt470bg) up front.
+        chain = "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt470bg:range=pc," + chain
     out_scale = f"scale={OUTPUT_RES.replace('x', ':')}:flags=bicubic" if OUTPUT_RES else ""
     trim = ["-t", f"{limit_s:.6f}", "-frames:v", str(n_frames), "-an", "-sn"]
     if remap_maps is None:
@@ -3115,12 +3153,13 @@ def _pipeline_config() -> dict:
         "record_encoder": record_enc[record_enc.index("-c:v") + 1] if "-c:v" in record_enc else None,
         "record_decoder": "mjpeg_cuvid" if any("mjpeg_cuvid" in a for a in best_record_decode_args()) else "software",
         "sync_encoder": sync_enc[sync_enc.index("-c:v") + 1] if "-c:v" in sync_enc else None,
+        "sync_decoder": _sync_decoder_name() if RECORD_MODE == "copy" else "software",
         "cpu_count": os.cpu_count(),
         "platform": platform.platform(),
     }
     # Knobs that only exist on some branches (test/one-encode).
     for name in ("RECORD_MODE", "UNDISTORT_BACKEND", "REMAP_OVERSAMPLE", "KEEP_RAW",
-                 "SYNC_PRESET", "SYNC_THREADS", "OUTPUT_RES", "PAUSE_PREVIEW_ON_STOP"):
+                 "SYNC_PRESET", "SYNC_THREADS", "OUTPUT_RES", "PAUSE_PREVIEW_ON_STOP", "SYNC_DECODER"):
         if name in globals():
             cfg[name.lower()] = globals()[name]
     return cfg
