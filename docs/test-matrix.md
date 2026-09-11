@@ -9,13 +9,15 @@ meets the stop-to-upload latency target. Three branches, each one variable:
 | `test/low-res` | Same pipeline as `main` at the default 1280x720 (the only additions are the resolution knob, calibration rescale and timing output), so it doubles as the baseline. | `RIG_CAPTURE_RES=1280x720` / `960x540` / `854x480` |
 | `test/one-encode` | Recorder stream-copies MJPEG (no encode during the take). One ffmpeg pass per camera at stop does trim, CFR, undistort (cam1) and the only H.264 encode. Includes the low-res knob. | `RIG_RECORD_MODE=copy` (default) / `encode`; `RIG_UNDISTORT_BACKEND=ffmpeg` (default) / `opencv`; `RIG_REMAP_OVERSAMPLE=2`; `RIG_KEEP_RAW=1` to keep the MJPEG |
 
-All runs below are CPU only: leave `FORCE_CUDA_RECORD` and `REQUIRE_CUDA_RECORD`
-unset (or `0`). The rig's launcher currently sets both to `1`; use a separate
-shell for these tests.
+All runs below are CPU only unless marked: launch with `DISABLE_CUDA_RECORD=1`
+and `FORCE_CUDA_RECORD` / `REQUIRE_CUDA_RECORD` unset. Unsetting the two
+launcher flags is not enough: the app probes CUDA on its own and uses NVENC
+whenever the driver answers (it did on 2026-09-11, driver 595.84). The rig's
+launcher sets both flags to `1`; use a separate shell for these tests.
 
 ## Before the first run (once)
 
-- [ ] On each camera Pi: `v4l2-ctl -d /dev/video0 --list-formats-ext | grep -A4 MJPG`. Note which sizes are listed at 90 fps. Only those sizes are valid for `RIG_CAPTURE_RES`.
+- [ ] On each camera Pi: `v4l2-ctl -d /dev/video0 --list-formats-ext` and read the whole MJPG block (a `grep -A4` shows only the first size). Only sizes listed at 90 fps are valid for `RIG_CAPTURE_RES`, and only same-aspect sizes keep the calibration valid. Result 2026-09-11, all three Pis: 1280x800, 1280x720, 800x600, 640x480, 320x240 at 90 fps. No 16:9 size below 720p exists, so R2, R3, R6 and R7 cannot be run as written; a downstream scale in the sync pass is the alternative if size still matters after R4.
 - [ ] Note the rig controller's CPU (`lscpu | grep "Model name"`, `nproc`) and free disk (`df -h` on the sessions volume). Copy mode writes about 0.7 GB per minute per camera at 720p until the take is validated.
 - [ ] Use the same athlete, drill, lighting and take length (60 s suggested) for every run so the numbers compare.
 
@@ -25,6 +27,7 @@ Do each run twice. Record everything from the "what to collect" list.
 
 | # | Branch | Env | Purpose |
 |---|---|---|---|
+| R0 | `test/low-res` | `FORCE_CUDA_RECORD=1 REQUIRE_CUDA_RECORD=1`, 720p | Reference only: what production ships today (NVENC when the driver answers). Not CPU only. |
 | R1 | `test/low-res` | CPU only, defaults (720p) | Baseline, identical pipeline to `main`. Does the live encode even keep up on the rig CPU? |
 | R2 | `test/low-res` | `RIG_CAPTURE_RES=960x540` | Resolution alone. |
 | R3 | `test/low-res` | `RIG_CAPTURE_RES=854x480` | Resolution alone, lower. |
@@ -49,7 +52,7 @@ From `pipeline_timing.json`:
 3. `sync_encodes.cam*`: each sync encode's `speed` (real-time factor on the rig CPU) and frame count. Frame counts must match across the three cameras.
 4. `undistort_step`: backend and, for the OpenCV path, `loop_seconds` and `encode_seconds`.
 5. `sync_files_mb`: the uploaded set.
-6. `validation_status` / `validation_usable`, and `config`: capture res, encoders, decoder, CUDA state and the branch knobs. Check `config.cuda_usable` is `false` and `config.sync_encoder` is `libx264` on every run; otherwise the run was not CPU-only.
+6. `validation_status` / `validation_usable`, and `config`: capture res, encoders, decoder, CUDA state and the branch knobs. Check `config.cuda_usable` is `false`, `config.disable_cuda` is `true` and `config.sync_encoder` is `libx264` on every run except R0; otherwise the run was not CPU-only.
 
 Still manual:
 
@@ -64,6 +67,7 @@ Copy one row per run.
 
 | Run | live drop / speed (`recorders`) | sync speed cam1 / cam2 / cam3 (`sync_encodes`) | `stop_to_ready_s` | `sync_s` / `postprocess_s` | sync MB total (`sync_files_mb`) | upload s | `validation_status` | analysis accuracy | notes |
 |---|---|---|---|---|---|---|---|---|---|
+| R0 | | | | | | | | | |
 | R1 | | | | | | | | | |
 | R2 | | | | | | | | | |
 | R3 | | | | | | | | | |
