@@ -41,6 +41,7 @@ None of the following is imported by V13:
 | `led.py` | Standalone BLE/HTTP LED synchronization utility | `.venv/bin/python tools/led.py` |
 | `multicam_snap.py` | Interactive multi-camera snapshot utility | `.venv/bin/python tools/multicam_snap.py` |
 | `lowres_bench.py` | Replays the record/sync/undistort pipeline at several capture resolutions and reports time, size, PSNR/SSIM (docs/lowres-benchmark.md) | `.venv/bin/python tools/lowres_bench.py --src take.mp4` |
+| `rig_matrix_run.sh` | Runs one docs/test-matrix.md row unattended on the rig: launches the app with the row's env, selects Wide-angle Sport, installs the calibration, records N takes through the UI's own routes, snapshots `top` mid-take and mid-stop, bundles the session minus videos and prints a per-take summary | `tools/rig_matrix_run.sh R9 3 15` / `tools/rig_matrix_run.sh R10 3 15 DISABLE_CUDA_RECORD=1 RIG_SYNC_PRESET=ultrafast RIG_SYNC_THREADS=3` |
 
 These files were kept as tools because they are self-contained and may still
 be useful during rig setup or diagnostics. They are not production service
