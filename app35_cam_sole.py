@@ -369,6 +369,38 @@ except ValueError:
     REMAP_OVERSAMPLE = 2
 KEEP_RAW = os.environ.get("RIG_KEEP_RAW", "").strip().lower() in ("1", "true", "yes", "on")
 RAW_COPY_SUFFIX = ".mkv"
+# CPU levers for the sync encode (docs/test-matrix.md, runs R10+). All default
+# to the pre-existing behaviour so the knobs only change a run that sets them.
+#   RIG_SYNC_PRESET    libx264 preset for the sync encode (default veryfast).
+#                      superfast / ultrafast trade file size and a little
+#                      quality for roughly 1.3x / 2x encode speed.
+#   RIG_SYNC_THREADS   -threads per sync ffmpeg (default 0 = x264 auto, which
+#                      opens ~1.5x the logical CPUs per process; with three
+#                      encodes in parallel that oversubscribes a small CPU).
+#   RIG_OUTPUT_RES     WxH the synced files are scaled to inside the sync pass
+#                      (after remap for cam1). Capture stays at RIG_CAPTURE_RES,
+#                      so the calibration is untouched; this only shrinks the
+#                      encode and the upload. Empty = no scaling.
+#   RIG_PAUSE_PREVIEW_ON_STOP=1 (default) stops the three preview decoders
+#                      while the stop pipeline runs so they do not compete with
+#                      the encodes for CPU; the UI shows the last frame until
+#                      the take is ready. 0 = keep the preview live.
+_X264_PRESETS = ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium")
+SYNC_PRESET = os.environ.get("RIG_SYNC_PRESET", "veryfast").strip().lower()
+if SYNC_PRESET not in _X264_PRESETS:
+    SYNC_PRESET = "veryfast"
+try:
+    SYNC_THREADS = max(0, int(os.environ.get("RIG_SYNC_THREADS", "0")))
+except ValueError:
+    SYNC_THREADS = 0
+OUTPUT_RES = os.environ.get("RIG_OUTPUT_RES", "").strip().lower()
+if OUTPUT_RES:
+    try:
+        _ow, _oh = (int(v) for v in OUTPUT_RES.split("x"))
+        OUTPUT_RES = f"{_ow}x{_oh}" if _ow > 0 and _oh > 0 else ""
+    except ValueError:
+        OUTPUT_RES = ""
+PAUSE_PREVIEW_ON_STOP = os.environ.get("RIG_PAUSE_PREVIEW_ON_STOP", "1").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _raw_video_path(recording_dir: Path, cam: str) -> Path | None:
@@ -635,6 +667,10 @@ frame_ts = {k: 0.0 for k in CAMERA_SOURCES}
 frame_locks = {k: threading.Lock() for k in CAMERA_SOURCES}
 stop_capture_evts = {k: threading.Event() for k in CAMERA_SOURCES}
 reopen_capture_evts = {k: threading.Event() for k in CAMERA_SOURCES}
+# Set by _run_stop_pipeline (RIG_PAUSE_PREVIEW_ON_STOP) while the stop
+# pipeline runs: capture_frames releases its RTSP stream and waits, so the
+# three preview decoders leave the CPU to the sync encodes.
+preview_pause_evt = threading.Event()
 
 # ---- Recording state. is_recording_evt is THE flag every route checks;
 # recording_index counts takes within the session (recording_N folders);
@@ -1568,7 +1604,10 @@ def best_sync_encoder_args():
             "nv12",
         ] + common_out
 
-    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"] + common_out
+    args = ["-c:v", "libx264", "-preset", SYNC_PRESET, "-crf", "20", "-pix_fmt", "yuv420p"]
+    if SYNC_THREADS > 0:
+        args += ["-threads", str(SYNC_THREADS)]
+    return args + common_out
 
 
 # FFmpeg prints 'start: <seconds>' in its input stream dump. Because the
@@ -1879,18 +1918,30 @@ def _build_sync_cmd(raw_path: Path, offset_s: float, duration_s: float, fps: flo
     encode) or an MJPEG mkv (copy mode; this is the only encode, and because
     every MJPEG frame is a keyframe -ss lands exactly on the requested frame).
     """
+    # Every camera must end up with the same frame count (validate_recording
+    # requires it). -t alone gives floor(duration*fps) on most cameras and one
+    # more on some (fps-filter rounding at the window edge; seen on every
+    # pipeline, one camera off by one). So the cut is -frames:v at the floor,
+    # with -t one frame period longer as the safety net.
+    n_frames = max(1, int(duration_s * fps + 1e-3))
+    limit_s = duration_s + (1.0 / fps if fps > 0 else 0.0)
     cmd = ["ffmpeg", "-y", "-ss", f"{offset_s:.6f}", "-i", str(raw_path)]
     chain = f"fps={fps:.6f},setpts=PTS-STARTPTS"
+    out_scale = f"scale={OUTPUT_RES.replace('x', ':')}:flags=bicubic" if OUTPUT_RES else ""
+    trim = ["-t", f"{limit_s:.6f}", "-frames:v", str(n_frames), "-an", "-sn"]
     if remap_maps is None:
-        cmd += ["-t", f"{duration_s:.6f}", "-an", "-sn", "-vf", chain]
+        if out_scale:
+            chain += f",{out_scale}"
+        cmd += trim + ["-vf", chain]
     else:
         xmap, ymap = remap_maps
         if REMAP_OVERSAMPLE > 1:
             chain += f",scale=iw*{REMAP_OVERSAMPLE}:ih*{REMAP_OVERSAMPLE}:flags=bilinear"
+        tail = f",{out_scale}" if out_scale else ""
         cmd += [
             "-i", str(xmap), "-i", str(ymap),
-            "-t", f"{duration_s:.6f}", "-an", "-sn",
-            "-filter_complex", f"[0:v]{chain}[v];[v][1:v][2:v]remap[out]",
+            *trim,
+            "-filter_complex", f"[0:v]{chain}[v];[v][1:v][2:v]remap{tail}[out]",
             "-map", "[out]",
         ]
     return cmd + best_sync_encoder_args() + [str(out_path)]
@@ -2170,6 +2221,9 @@ def capture_frames(cam_key, source_url: str):
     last_frame_wall = 0.0
 
     while not stop_capture_evts[cam_key].is_set():
+        if preview_pause_evt.is_set():
+            time.sleep(0.2)
+            continue
         cap = _open_cv_rtsp(source_url)
         if not cap.isOpened():
             time.sleep(backoffs[0])
@@ -2180,6 +2234,8 @@ def capture_frames(cam_key, source_url: str):
         while not stop_capture_evts[cam_key].is_set():
             if reopen_capture_evts[cam_key].is_set():
                 reopen_capture_evts[cam_key].clear()
+                break
+            if preview_pause_evt.is_set():
                 break
 
             ok, frame = cap.read()
@@ -2978,17 +3034,32 @@ def _undistort_video_file(src: Path, dst: Path, calibration_data: dict) -> dict:
 
 
 FFMPEG_PROGRESS_RE = re.compile(
-    r"frame=\s*(?P<frame>\d+).*?fps=\s*(?P<fps>[\d.]+).*?"
+    r"(?:frame=\s*(?P<frame>\d+).*?fps=\s*(?P<fps>[\d.]+).*?)?"
+    r"(?:size=\s*(?P<size_kb>\d+)kB.*?)?time=\s*(?P<time>[\d:.]+).*?"
     r"(?:dup=\s*(?P<dup>\d+).*?drop=\s*(?P<drop>\d+).*?)?speed=\s*(?P<speed>[\d.]+)x"
 )
 
 
+def _ffmpeg_time_to_s(text: str) -> float | None:
+    """'HH:MM:SS.ss' from an ffmpeg progress line as seconds."""
+    try:
+        parts = [float(v) for v in text.split(":")]
+    except ValueError:
+        return None
+    while len(parts) < 3:
+        parts.insert(0, 0.0)
+    return round(parts[0] * 3600 + parts[1] * 60 + parts[2], 3)
+
+
 def _ffmpeg_log_stats(log_path: Path) -> dict | None:
-    """Last progress line of an ffmpeg log as {frame, fps, dup, drop, speed}.
+    """Last progress line of an ffmpeg log as {frame, fps, time_s, dup, drop, speed}.
 
     ffmpeg writes progress with carriage returns, so the file is split on
     both \r and \n. `speed` is the real-time factor (>= 1.0 kept up),
     `drop`/`dup` come from the fps filter (encode-mode recorders only).
+    Stream-copy recorders (copy mode) print no frame=/fps=, only size, time
+    and speed, so `frame`/`fps` are absent for them and `time_s` (seconds of
+    media written) is the progress figure instead.
     Returns None when the log is missing or carries no progress line.
     """
     if not log_path.exists():
@@ -3004,7 +3075,15 @@ def _ffmpeg_log_stats(log_path: Path) -> dict | None:
             last = m
     if last is None:
         return None
-    out = {"frame": int(last.group("frame")), "fps": float(last.group("fps")), "speed": float(last.group("speed"))}
+    out = {"speed": float(last.group("speed"))}
+    if last.group("frame") is not None:
+        out["frame"] = int(last.group("frame"))
+        out["fps"] = float(last.group("fps"))
+    time_s = _ffmpeg_time_to_s(last.group("time"))
+    if time_s is not None:
+        out["time_s"] = time_s
+    if last.group("size_kb") is not None:
+        out["size_mb"] = round(int(last.group("size_kb")) / 1024.0, 2)
     if last.group("dup") is not None:
         out["dup"] = int(last.group("dup"))
         out["drop"] = int(last.group("drop"))
@@ -3040,7 +3119,8 @@ def _pipeline_config() -> dict:
         "platform": platform.platform(),
     }
     # Knobs that only exist on some branches (test/one-encode).
-    for name in ("RECORD_MODE", "UNDISTORT_BACKEND", "REMAP_OVERSAMPLE", "KEEP_RAW"):
+    for name in ("RECORD_MODE", "UNDISTORT_BACKEND", "REMAP_OVERSAMPLE", "KEEP_RAW",
+                 "SYNC_PRESET", "SYNC_THREADS", "OUTPUT_RES", "PAUSE_PREVIEW_ON_STOP"):
         if name in globals():
             cfg[name.lower()] = globals()[name]
     return cfg
@@ -3058,22 +3138,26 @@ def _run_stop_pipeline(recording_dir: Path, stop_started_at: float | None = None
     """
     stages = {}
     t_total = time.time()
+    if PAUSE_PREVIEW_ON_STOP:
+        preview_pause_evt.set()
+    try:
+        t0 = time.time()
+        sync_result = run_sync_on_dir(recording_dir)
+        stages["sync_s"] = round(time.time() - t0, 3)
 
-    t0 = time.time()
-    sync_result = run_sync_on_dir(recording_dir)
-    stages["sync_s"] = round(time.time() - t0, 3)
+        t0 = time.time()
+        processing = postprocess_recording_for_upload(recording_dir)
+        stages["postprocess_s"] = round(time.time() - t0, 3)
 
-    t0 = time.time()
-    processing = postprocess_recording_for_upload(recording_dir)
-    stages["postprocess_s"] = round(time.time() - t0, 3)
+        t0 = time.time()
+        validation = validate_recording(recording_dir)
+        stages["validate_s"] = round(time.time() - t0, 3)
 
-    t0 = time.time()
-    validation = validate_recording(recording_dir)
-    stages["validate_s"] = round(time.time() - t0, 3)
-
-    extra = _stop_pipeline_extra(recording_dir, sync_result, validation)
-    if extra:
-        stages.update(extra)
+        extra = _stop_pipeline_extra(recording_dir, sync_result, validation)
+        if extra:
+            stages.update(extra)
+    finally:
+        preview_pause_evt.clear()
 
     pipeline_s = round(time.time() - t_total, 3)
     now = time.time()

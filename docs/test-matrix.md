@@ -36,6 +36,10 @@ Do each run twice. Record everything from the "what to collect" list.
 | R6 | `test/one-encode` | `RIG_CAPTURE_RES=960x540` | One encode plus resolution. The expected candidate. |
 | R7 | `test/one-encode` | `RIG_CAPTURE_RES=854x480` | Same, lower. |
 | R8 | `test/one-encode` | `RIG_REMAP_OVERSAMPLE=1` | Only if analysis accuracy on R4 is worse than R1: checks whether the nearest-neighbour remap is the cause. |
+| R9 | `test/one-encode` | GPU: `DISABLE_CUDA_RECORD` unset, defaults | One encode with NVENC: copy recorder, single NVENC pass per camera, no Python loop. Not CPU only; the fastest option while the driver works. |
+| R10 | `test/one-encode` | `DISABLE_CUDA_RECORD=1 RIG_SYNC_PRESET=ultrafast RIG_SYNC_THREADS=3` | CPU levers, quality kept at 720p: cheaper x264 preset, no thread oversubscription, preview paused (default). |
+| R11 | `test/one-encode` | R10 + `RIG_OUTPUT_RES=960x540` | CPU levers plus a smaller output. Needs the cloud accuracy check. |
+| R12 | `test/one-encode` | R11 + `RIG_REMAP_OVERSAMPLE=1` | Everything: cam1 was the slowest encode (0.34x vs 0.49x) because of the 2x oversampled remap. |
 
 ## What to collect per run
 
@@ -61,6 +65,30 @@ Still manual:
 9. Upload time for the take from `logs/upload.log` (the `Enqueued` and `Uploaded` lines carry timestamps).
 10. Analysis result on the uploaded take, from the cloud side. This is the accuracy number and the only thing the rig cannot measure.
 
+## Results (rig, 2026-09-11)
+
+Rig: Acer Nitro AN515-55, i5-10300H (4 cores / 8 threads), 23 GB, NVMe, ffmpeg
+6.1.1, NVIDIA driver 595.84 (GPU alive again). Wide-angle sport, cam1
+undistorted, no insoles attached (so every take validates `unusable` on the
+required BLE check; ignore that column). Takes were not all the same length;
+the per-second column is the comparable figure because every pipeline so far
+has been linear in take length.
+
+| Run | take s | live recorder speed | sync s | postprocess s | stop_to_ready s | s per take-second | sync MB | notes |
+|---|---|---|---|---|---|---|---|---|
+| R0 (archery, no undistort) | 65.5 | 1.01 | 59.2 | 0.0 | 61.4 | 0.94 | 599 | NVENC sync at ~1.15x |
+| R0 (archery, no undistort) | 32.2 | 1.01 | 27.2 | 0.0 | 29.2 | 0.90 | 293 | frame counts 2901/2902/2902 |
+| R0 | 39.0 | 1.01 | 35.5 | 53.5 (loop 46.3 + encode 7.1) | 90.8 | 2.33 | 330 | production reference |
+| R0 | 76.3 | 1.00 | 70.8 | 105.7 (loop 92.0 + encode 13.6) | 178.5 | 2.34 | 635 | frame counts 6869/6869/6870 |
+| R1 | 60 wall | **0.49 to 0.51** | 57.1 | 52.7 | 111.8 | 3.80 per content-second | 57 | only 29.4 s of content captured: live libx264 could not keep up, CPU at 98% |
+| R4 | 16.9 | 1.01 (copy) | 51.2 | 0.0 | 53.0 | 3.13 | 45 | sync encodes 0.34x (cam1) / 0.49x / 0.49x; frame counts 1524/1524/1525; x264 opened 12 threads per process |
+
+Decisions so far: R1 rules out today's pipeline on the CPU (half the frames).
+R4 proves the copy recorder and the fused undistort on hardware, and its upload
+is 7x smaller than R0's, but three parallel 720p90 x264 encodes on four cores
+are 3.1 s per take-second, slower than the GPU path. Next: R9 (one encode on
+the GPU, the quick win while the driver works) and R10 to R12 (CPU levers).
+
 ## Results template
 
 Copy one row per run.
@@ -76,6 +104,10 @@ Copy one row per run.
 | R6 | | | | | | | | | |
 | R7 | | | | | | | | | |
 | R8 | | | | | | | | | |
+| R9 | | | | | | | | | |
+| R10 | | | | | | | | | |
+| R11 | | | | | | | | | |
+| R12 | | | | | | | | | |
 
 ## Decision rules
 
@@ -84,6 +116,8 @@ Copy one row per run.
 - If R6 or R7 accuracy holds, adopt that resolution. If not, stay at 720p with one encode.
 - If R4 accuracy is below R1 and R8 fixes it, oversample was the cause. If R8 does not fix it, switch `RIG_UNDISTORT_BACKEND=opencv` and accept the extra pass for cam1.
 - Stop latency that is still too long after R4 or R6 is a scheduling problem, not an encoding one: the fix is moving the sync pass off the stop request into a background process, which is independent of everything above.
+- Every take is short (about 15 s in production), so fixed costs count: run the decisive rows at 15 s, three takes each.
+- If the GPU stays reliable, R9 is the candidate: it removes the live encode and the Python loop and keeps NVENC for the one pass. CPU-only (R10 to R12) is the fallback if the driver goes away again.
 
 ## Bench numbers to compare against
 

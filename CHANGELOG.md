@@ -1,5 +1,21 @@
 # Changelog
 
+## test/one-encode — rig results and CPU levers (2026-09-11, branch `test/one-encode`)
+
+First hardware runs (`docs/test-matrix.md`, results section): the copy recorder
+works on the live cameras, but three parallel libx264 encodes at 720p90 run at
+about 0.5x on the rig's 4-core i5, so CPU-only stop latency is 3.1 s per second
+of take against 2.3 s on the GPU path. Added, all defaulting to the previous
+behaviour: `RIG_SYNC_PRESET`, `RIG_SYNC_THREADS`, `RIG_OUTPUT_RES` (scale inside
+the sync pass, calibration untouched) and `RIG_PAUSE_PREVIEW_ON_STOP` (default on:
+the preview decoders release their RTSP streams while the stop pipeline runs).
+`DISABLE_CUDA_RECORD=1` forces the CPU path on a rig whose GPU works (the probe
+otherwise picks NVENC regardless of `FORCE_CUDA_RECORD`). Fixes: every sync
+encode is cut with `-frames:v` at floor(duration*fps) so the three cameras get
+identical frame counts (they were off by one on every pipeline, failing the
+required validation check); copy-mode recorder progress (no `frame=`) is parsed
+into `recorders.<cam>.time_s` / `speed`.
+
 ## test/one-encode — one H.264 encode per camera (2026-09-10, branch `test/one-encode`)
 
 CPU-only goal. `RIG_RECORD_MODE=copy` (default on this branch) makes each recorder
