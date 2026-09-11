@@ -62,7 +62,8 @@ Threading model
 
 Environment knobs
   RIG_API_TOKEN, RIG_SSH_STRICT / RIG_SSH_KNOWN_HOSTS, PI_SSH_USER,
-  CAMERA_BOOTSTRAP_ENABLED, FORCE_CUDA_RECORD / REQUIRE_CUDA_RECORD,
+  CAMERA_BOOTSTRAP_ENABLED, FORCE_CUDA_RECORD / REQUIRE_CUDA_RECORD /
+  DISABLE_CUDA_RECORD,
   APP_USE_CASE (default sport), MIC_CAMERA_KEY, RIG_LOG_LEVEL /
   RIG_BLE_LOG_LEVEL, FORGEON_API_URL / FORGEON_DEVICE_TOKEN (debug override
   for the pairing file), RIG_CAPTURE_RES (camera WxH, default 1280x720).
@@ -323,6 +324,11 @@ RECORDING_JPEG_QUALITY = 55
 TARGET_FPS_WRITE = 90
 FORCE_CUDA_RECORD = os.environ.get("FORCE_CUDA_RECORD", "").strip().lower() in ("1", "true", "yes", "on")
 REQUIRE_CUDA_RECORD = os.environ.get("REQUIRE_CUDA_RECORD", "").strip().lower() in ("1", "true", "yes", "on")
+# DISABLE_CUDA_RECORD=1 makes the CUDA probe answer "unusable" so every stage
+# takes the CPU path (software MJPEG decode, libx264) even on a rig whose GPU
+# works. It wins over FORCE_CUDA_RECORD; with REQUIRE_CUDA_RECORD it refuses
+# to record, which is the honest answer to a contradictory environment.
+DISABLE_CUDA_RECORD = os.environ.get("DISABLE_CUDA_RECORD", "").strip().lower() in ("1", "true", "yes", "on")
 
 # Preview capture: give up on a stalled stream after RTSP_TIMEOUT_MS and
 # reconnect with the (cyclic) RTSP_RETRY_BACKOFF delays.
@@ -1373,6 +1379,10 @@ def _ffmpeg_has_usable_cuda() -> bool:
     if _cuda_available_cache is not None:
         return _cuda_available_cache
 
+    if DISABLE_CUDA_RECORD:
+        _cuda_available_cache = False
+        return _cuda_available_cache
+
     sys_name = platform.system().lower()
     if sys_name not in ("linux", "windows"):
         _cuda_available_cache = False
@@ -1409,7 +1419,10 @@ def _ffmpeg_has_usable_cuda() -> bool:
 
 
 def _record_cuda_enabled() -> bool:
-    """CUDA path for recording: forced by FORCE_CUDA_RECORD, else probed."""
+    """CUDA path for recording: off with DISABLE_CUDA_RECORD, forced by
+    FORCE_CUDA_RECORD, else probed."""
+    if DISABLE_CUDA_RECORD:
+        return False
     if FORCE_CUDA_RECORD:
         return True
     return _ffmpeg_has_usable_cuda()
@@ -2144,10 +2157,11 @@ def start_recording_all():
         raise RuntimeError("CUDA is required for recording, but FFmpeg CUDA init failed in this runtime.")
 
     rig_log.info(
-        "[record] CUDA probe=%s force_cuda=%s require_cuda=%s",
+        "[record] CUDA probe=%s force_cuda=%s require_cuda=%s disable_cuda=%s",
         "OK" if cuda_ok else "FAIL",
         FORCE_CUDA_RECORD,
         REQUIRE_CUDA_RECORD,
+        DISABLE_CUDA_RECORD,
     )
 
     recording_index += 1
@@ -2797,6 +2811,7 @@ def _pipeline_config() -> dict:
         "cuda_usable": bool(_ffmpeg_has_usable_cuda()),
         "force_cuda": FORCE_CUDA_RECORD,
         "require_cuda": REQUIRE_CUDA_RECORD,
+        "disable_cuda": DISABLE_CUDA_RECORD,
         "record_encoder": record_enc[record_enc.index("-c:v") + 1] if "-c:v" in record_enc else None,
         "record_decoder": "mjpeg_cuvid" if any("mjpeg_cuvid" in a for a in best_record_decode_args()) else "software",
         "sync_encoder": sync_enc[sync_enc.index("-c:v") + 1] if "-c:v" in sync_enc else None,
