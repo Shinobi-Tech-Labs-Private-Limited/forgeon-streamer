@@ -82,12 +82,37 @@ has been linear in take length.
 | R0 | 76.3 | 1.00 | 70.8 | 105.7 (loop 92.0 + encode 13.6) | 178.5 | 2.34 | 635 | frame counts 6869/6869/6870 |
 | R1 | 60 wall | **0.49 to 0.51** | 57.1 | 52.7 | 111.8 | 3.80 per content-second | 57 | only 29.4 s of content captured: live libx264 could not keep up, CPU at 98% |
 | R4 | 16.9 | 1.01 (copy) | 51.2 | 0.0 | 53.0 | 3.13 | 45 | sync encodes 0.34x (cam1) / 0.49x / 0.49x; frame counts 1524/1524/1525; x264 opened 12 threads per process |
+| R4 | 22.3 | 1.01 (copy) | 65.7 | 0.0 | 68.4 | 3.07 | 59 | mid-stop `top`: preview 1.4 cores, Chrome 0.5, encoders starved |
+| R9 (old commit: software decode, preview live) | 23.2 | 1.01 (copy) | 37.6 | 0.0 | 39.5 | 1.70 | 228 | NVENC sync 0.63x (cam1) / 1.0x / 0.96x; capped by the software MJPEG decode |
+| R9 | 41.6 | 1.01 (copy) | 37.6 | 0.0 | 39.8 | 0.96 | 220 | mjpeg_cuvid + preview paused; 1.10x (cam1) / 2.12x / 2.07x; frame counts equal |
+| R9 | 15.5 | 1.01 (copy) | 11.2 | 0.0 | 12.0 | 0.78 | 124 | 1.50x / 5.10x / 2.73x (script run, take 1) |
+| R9 | 30.4 | 1.01 (copy) | 32.9 | 0.0 | 34.8 | 1.14 | | 0.92x / 1.84x / 1.78x |
+| R9 | 15.7 | 1.01 (copy) | 15.4 | 0.0 | 17.3 | 1.10 | | 1.04x / 2.00x / 1.91x; 6 s into the stop only cam1's ffmpeg was left, at 2.9 cores |
+| R9b (`RIG_REMAP_OVERSAMPLE=1`) | 39.2 | 1.01 (copy) | 33.5 | 0.0 | 35.4 | 0.90 | | 1.18x / 1.99x / 1.94x: dropping the oversample barely moves cam1 |
+
+Standalone decode/encode bench on the rig (R9b's 39 s raw files, three streams in
+parallel, `-f null`): GPU decode alone 3.7-4.0x per stream, CPU decode alone
+3.3-3.5x, GPU decode + NVENC 2.8-2.9x, CPU decode + NVENC 1.5x, mixed (cam1 CPU)
+1.8/2.6/2.6x. So the GPU decoder is not a shared bottleneck and all-GPU is the
+right assignment; cam2/cam3 lose ~30% to the trim, fps filter and moov rewrite.
+cam1's ~1.1x is the remap path: ffmpeg's remap only takes 4:4:4 (or RGB), so
+every frame is converted NV12 -> yuv444p -> remap -> NV12 on the CPU, about one
+core-second per second of video, independent of the oversample.
 
 Decisions so far: R1 rules out today's pipeline on the CPU (half the frames).
 R4 proves the copy recorder and the fused undistort on hardware, and its upload
 is 7x smaller than R0's, but three parallel 720p90 x264 encodes on four cores
-are 3.1 s per take-second, slower than the GPU path. Next: R9 (one encode on
-the GPU, the quick win while the driver works) and R10 to R12 (CPU levers).
+are 3.1 s per take-second, slower than the GPU path. R9 (copy recorder, GPU
+decode, one NVENC pass, preview paused) is the candidate: 0.8-1.15 s per
+take-second, a 15 s take ready in 12-17 s against 35 s in production. R9b
+(oversample 1) buys nothing, so oversample 2 stays for quality. The remaining
+lever is cam1's remap: a per-plane remap (luma full size, chroma half size,
+no 4:4:4 round trip) should bring cam1 near the other cameras (~8 s for a 15 s
+take); moving undistortion to the cloud would remove the stage entirely
+(~6 s). R10-R12 (CPU levers) are the fallback if the driver goes away again.
+Still open: cloud analysis accuracy for one R0, one R9 and one R9b take; the
+cam2 Pi that delivered no stream after a stop and never became healthy on a
+later launch (its RTSP server reported running).
 
 ## Results template
 
