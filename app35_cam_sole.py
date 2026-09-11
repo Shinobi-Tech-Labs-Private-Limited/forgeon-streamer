@@ -3161,7 +3161,10 @@ def _pipeline_config() -> dict:
     for name in ("RECORD_MODE", "UNDISTORT_BACKEND", "REMAP_OVERSAMPLE", "KEEP_RAW",
                  "SYNC_PRESET", "SYNC_THREADS", "OUTPUT_RES", "PAUSE_PREVIEW_ON_STOP", "SYNC_DECODER"):
         if name in globals():
-            cfg[name.lower()] = globals()[name]
+            # sync_decoder is the decoder that actually runs (set above);
+            # the knob's own value goes under its own key.
+            key = "sync_decoder_knob" if name == "SYNC_DECODER" else name.lower()
+            cfg[key] = globals()[name]
     return cfg
 
 
