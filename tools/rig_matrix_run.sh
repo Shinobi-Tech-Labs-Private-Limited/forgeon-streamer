@@ -16,8 +16,10 @@
 #   RIG_DIR        repo checkout (default: the directory above this script)
 #   CAL_JSON       calibration_cam1.json to install (default: newest one under
 #                  sessions/*/calibration/)
-#   WARMUP_S       seconds to wait after launch for the Pis to bootstrap (25)
-#   GAP_S          seconds between takes, for the Pi RTSP restart (15)
+#   CAM_WAIT_S     max seconds to wait, before every take, for all cameras to
+#                  report preview_healthy on /api/camera/status (120). The Pi
+#                  streams restart after each stop; a fixed gap is not enough.
+#   GAP_S          minimum seconds between takes before that wait starts (5)
 #   OUT_DIR        where console log, snapshots and the bundle go (/tmp/rig-runs)
 #
 # Needs: bash, curl, python3 (for the summary), the app's .venv. The rig must
@@ -35,8 +37,8 @@ RUN_ENV=("$@")
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 RIG_DIR=${RIG_DIR:-$(dirname "$HERE")}
 OUT_DIR=${OUT_DIR:-/tmp/rig-runs}
-WARMUP_S=${WARMUP_S:-25}
-GAP_S=${GAP_S:-15}
+CAM_WAIT_S=${CAM_WAIT_S:-120}
+GAP_S=${GAP_S:-5}
 BASE=http://127.0.0.1:5000
 RUN_DIR="$OUT_DIR/$RUN"
 mkdir -p "$RUN_DIR"
@@ -44,6 +46,34 @@ mkdir -p "$RUN_DIR"
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 die() { log "ERROR: $*"; exit 1; }
 snap() { top -bn1 | head -20 > "$1"; }
+
+# Camera readiness as the UI sees it: every camera preview_healthy (fresh
+# preview frames, which implies the Pi's RTSP server is up again after the
+# post-stop restart). Prints "ok" or the per-camera state.
+cam_state() {
+  curl -sf "$BASE/api/camera/status" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("no-json"); sys.exit(0)
+cams = d.get("cameras", {})
+bad = ["%s:%s/rtsp=%d/preview=%d" % (k, v.get("state"), bool(v.get("rtsp_server_running")), bool(v.get("preview_healthy")))
+       for k, v in cams.items() if not v.get("preview_healthy")]
+print("ok" if cams and not bad else " ".join(bad) or "no-cameras")
+'
+}
+
+wait_cameras() {
+  local deadline=$(( $(date +%s) + CAM_WAIT_S )) state last=""
+  while :; do
+    state=$(cam_state)
+    [ "$state" = "ok" ] && { log "cameras ready"; return 0; }
+    [ "$state" != "$last" ] && { log "waiting for cameras: $state"; last=$state; }
+    [ "$(date +%s)" -ge "$deadline" ] && { log "cameras not ready after ${CAM_WAIT_S}s: $state"; return 1; }
+    sleep 2
+  done
+}
 
 cd "$RIG_DIR" || die "no such dir: $RIG_DIR"
 [ -x .venv/bin/python ] || die "no .venv in $RIG_DIR"
@@ -99,8 +129,8 @@ echo "$resp" | grep -q '"json_path"' || die "calibration upload failed: $resp"
 [ -f "$SESSION/calibration/calibration_cam1.json" ] || die "calibration not in $SESSION/calibration"
 log "sport=wide_angle, calibration installed"
 
-log "warming up ${WARMUP_S}s for the camera Pis"
-sleep "$WARMUP_S"
+sleep 3
+wait_cameras || die "cameras never became healthy after launch; see $RUN_DIR/console.log"
 
 # ---- takes -----------------------------------------------------------------
 for i in $(seq 1 "$TAKES"); do
@@ -117,6 +147,13 @@ for i in $(seq 1 "$TAKES"); do
   sleep "$half"
   snap "$RUN_DIR/take${i}_top.txt"
   ls -la "$REC" > "$RUN_DIR/take${i}_ls_midtake.txt" 2>&1
+  # Copy mode writes ~12 MB/s per camera; a raw file still under 1 MB at
+  # mid-take means that camera's stream never delivered.
+  for f in "$REC"/cam*.mkv "$REC"/cam*.mp4; do
+    [ -f "$f" ] || continue
+    sz=$(stat -c %s "$f" 2>/dev/null || echo 0)
+    [ "$sz" -lt 1000000 ] && log "WARNING take $i: $(basename "$f") is only ${sz} bytes at mid-take"
+  done
   sleep $(( TAKE_S - half ))
 
   log "take $i: stop (the stop request blocks until the take is ready)"
@@ -133,7 +170,10 @@ for i in $(seq 1 "$TAKES"); do
   else
     log "take $i: NO pipeline_timing.json in $REC; stop response: $resp"
   fi
-  [ "$i" -lt "$TAKES" ] && { log "gap ${GAP_S}s"; sleep "$GAP_S"; }
+  if [ "$i" -lt "$TAKES" ]; then
+    sleep "$GAP_S"
+    wait_cameras || log "WARNING: starting take $((i + 1)) with cameras not all healthy"
+  fi
 done
 
 # ---- wind down -------------------------------------------------------------
